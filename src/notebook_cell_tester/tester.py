@@ -533,7 +533,7 @@ class ColabTestFramework:
                 if not passed and error_message:
                     message = error_message
                 else:
-                    message = f"Test {'passed' if not passed else 'did not pass'}"
+                    message = f"Test {'did not passed' if not passed else 'passed'}"
             else:
                 # Regular regex - pass when there IS a match
                 passed = match is not None
