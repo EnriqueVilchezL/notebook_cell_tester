@@ -533,14 +533,14 @@ class ColabTestFramework:
                 if not passed and error_message:
                     message = error_message
                 else:
-                    message = f"Pattern '{pattern}' {'should not be present but was found' if not passed else 'correctly not found'} in code"
+                    message = f"Test {'passed' if not passed else 'did not pass'}"
             else:
                 # Regular regex - pass when there IS a match
                 passed = match is not None
                 if not passed and error_message:
                     message = error_message
                 else:
-                    message = f"Pattern '{pattern}' {'found' if passed else 'not found'} in code"
+                    message = f"Test {'passed' if passed else 'did not pass'}"
             
             return TestResult(
                 test_name,
