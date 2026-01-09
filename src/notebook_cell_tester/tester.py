@@ -518,7 +518,7 @@ class ColabTestFramework:
             if not passed and error_message:
                 message = error_message
             else:
-                message = f"Pattern '{pattern}' {'found' if passed else 'not found'} in code"
+                message = f"Test {'passed' if passed else 'didn\'t pass'}"
             
             return TestResult(
                 test_name,
