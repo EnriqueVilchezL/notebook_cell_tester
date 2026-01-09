@@ -51,6 +51,7 @@ class TestCase:
             - 'return': Test function return value
             - 'exception': Test if function raises expected exception
             - 'regex': Test if code matches a regex pattern
+            - 'not_regex': Test if code does NOT match a regex pattern
             - 'variable': Test variable value using a validator function
         function_name: Name of the function to test. If None, tests entire cell execution.
             Required for function-level tests.
@@ -65,7 +66,7 @@ class TestCase:
             - For 'variable' tests: Optional, used in error messages
         validator: Lambda or function to validate variable value. Must return bool.
             Required when test_type='variable'.
-        pattern: Regex pattern to match in code. Required when test_type='regex'.
+        pattern: Regex pattern to match in code. Required when test_type='regex' or 'not_regex'.
         description: Additional description for the test (currently unused).
         error_message: Custom error message shown to students when test fails.
             For variable tests, use {value} placeholder for actual value.
@@ -90,13 +91,22 @@ class TestCase:
                 expected="Hello, Alice!"
             )
         
-        Test code pattern::
+        Test code pattern exists::
         
             TestCase(
                 name="Uses for loop",
                 test_type="regex",
                 pattern=r"for\s+\w+\s+in\s+",
                 error_message="Your code must use a for loop"
+            )
+        
+        Test code pattern does NOT exist::
+        
+            TestCase(
+                name="Does not use global variables",
+                test_type="not_regex",
+                pattern=r"global\s+\w+",
+                error_message="Your code should not use global variables"
             )
         
         Test variable validation::
@@ -473,20 +483,23 @@ class ColabTestFramework:
                 str(e)
             )
     
-    def test_code_pattern(self, test_name: str, pattern: str, description: str, error_message: str = "") -> TestResult:
-        """Test if code contains a specific regex pattern.
+    def test_code_pattern(self, test_name: str, pattern: str, description: str, 
+                          error_message: str = "", negate: bool = False) -> TestResult:
+        """Test if code contains (or does not contain) a specific regex pattern.
         
         Searches the student's code for a regex pattern match. Useful for verifying
-        that students use specific language constructs (loops, conditionals, etc.).
+        that students use specific language constructs (loops, conditionals, etc.)
+        or avoid certain patterns (like global variables, print statements, etc.).
         
         Args:
             test_name: Name of the test for display purposes.
             pattern: Regex pattern to search for in the code.
             description: Description of what the pattern checks (currently unused).
-            error_message: Custom error message shown to students when pattern not found.
+            error_message: Custom error message shown to students when test fails.
+            negate: If True, test passes when pattern is NOT found (for not_regex tests).
         
         Returns:
-            TestResult object indicating if pattern was found.
+            TestResult object indicating if pattern was found (or not found if negated).
         
         Examples:
             Check for for loop::
@@ -498,13 +511,14 @@ class ColabTestFramework:
                     error_message="Your code must use a for loop"
                 )
             
-            Check for function definition::
+            Check that global keyword is NOT used::
             
                 result = tester.test_code_pattern(
-                    test_name="Defines calculate function",
-                    pattern=r"def\s+calculate\s*\(",
+                    test_name="No global variables",
+                    pattern=r"global\s+\w+",
                     description="",
-                    error_message="You must define a function called 'calculate'"
+                    error_message="Your code should not use global variables",
+                    negate=True
                 )
         
         Note:
@@ -512,13 +526,21 @@ class ColabTestFramework:
         """
         try:
             match = re.search(pattern, self.student_code, re.MULTILINE | re.DOTALL)
-            passed = match is not None
             
-            # Use custom error message if provided, otherwise use default
-            if not passed and error_message:
-                message = error_message
+            # For not_regex, we want to pass when there's NO match
+            if negate:
+                passed = match is None
+                if not passed and error_message:
+                    message = error_message
+                else:
+                    message = f"Pattern '{pattern}' {'should not be present but was found' if not passed else 'correctly not found'} in code"
             else:
-                message = f"Test {'passed' if passed else 'didn\'t pass'}"
+                # Regular regex - pass when there IS a match
+                passed = match is not None
+                if not passed and error_message:
+                    message = error_message
+                else:
+                    message = f"Pattern '{pattern}' {'found' if passed else 'not found'} in code"
             
             return TestResult(
                 test_name,
@@ -679,12 +701,22 @@ class ColabTestFramework:
         
         for test in tests:
             if test.test_type == 'regex':
-                # Code pattern test
+                # Code pattern test (must match)
                 result = self.test_code_pattern(
                     test.name,
                     test.pattern,
                     test.description,
-                    test.error_message
+                    test.error_message,
+                    negate=False
+                )
+            elif test.test_type == 'not_regex':
+                # Code pattern test (must NOT match)
+                result = self.test_code_pattern(
+                    test.name,
+                    test.pattern,
+                    test.description,
+                    test.error_message,
+                    negate=True
                 )
             elif test.test_type == 'variable':
                 # Variable validation test
@@ -753,6 +785,8 @@ class ColabTestFramework:
         # Handle case where no tests were run
         if total == 0:
             print("⚠️  No tests were executed.")
+            print("📝 Make sure to execute the cell with your solution code first,")
+            print("   then run this test cell.")
             return
         
         passed = sum(1 for r in self.results if r.passed)
