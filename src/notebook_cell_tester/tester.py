@@ -753,8 +753,6 @@ class ColabTestFramework:
         # Handle case where no tests were run
         if total == 0:
             print("⚠️  No tests were executed.")
-            print("📝 Make sure to execute the cell with your solution code first,")
-            print("   then run this test cell.")
             return
         
         passed = sum(1 for r in self.results if r.passed)
