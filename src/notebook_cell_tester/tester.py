@@ -309,9 +309,12 @@ class ColabTestFramework:
             
             try:
                 with redirect_stdout(f):
-                    # Create a fresh namespace for execution to avoid conflicts
-                    exec_namespace = {}
-                    # Execute the student code in isolated namespace
+                    # Create a namespace with built-in input redirected
+                    exec_namespace = {
+                        '__builtins__': __builtins__,
+                        'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
+                    }
+                    # Execute the student code in namespace with custom input
                     exec(self.student_code, exec_namespace)
                 
                 output = f.getvalue().strip()
@@ -533,14 +536,14 @@ class ColabTestFramework:
                 if not passed and error_message:
                     message = error_message
                 else:
-                    message = f"Test {'did not passed' if not passed else 'passed'}"
+                    message = f"Pattern '{pattern}' {'should not be present but was found' if not passed else 'correctly not found'} in code"
             else:
                 # Regular regex - pass when there IS a match
                 passed = match is not None
                 if not passed and error_message:
                     message = error_message
                 else:
-                    message = f"Test {'passed' if passed else 'did not pass'}"
+                    message = f"Pattern '{pattern}' {'found' if passed else 'not found'} in code"
             
             return TestResult(
                 test_name,
