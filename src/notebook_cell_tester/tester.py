@@ -727,20 +727,20 @@ class ColabTestFramework:
                     test.expected,
                     test.error_message
                 )
+            elif test.test_type == 'output' and not test.function_name:
+                # Cell output test (no function specified)
+                result = self.test_cell_output(
+                    test.name,
+                    test.stdin_input or "",
+                    test.expected
+                )
             elif test.function_name:
-                # Function test
+                # Function test (return, output, exception)
                 result = self.test_function(
                     test.name,
                     test.function_name,
                     test.test_type,
                     test.inputs,
-                    test.stdin_input or "",
-                    test.expected
-                )
-            elif test.test_type == 'output':
-                # Cell test
-                result = self.test_cell_output(
-                    test.name,
                     test.stdin_input or "",
                     test.expected
                 )
