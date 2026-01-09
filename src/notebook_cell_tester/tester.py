@@ -218,12 +218,28 @@ class ColabTestFramework:
             if last_input and len(last_input) > 1:
                 # Get second to last (current cell is last)
                 self.student_code = last_input[-2] if len(last_input) >= 2 else last_input[-1]
+                
+                # Check if the loaded code contains test framework code
+                if 'ColabTestFramework' in self.student_code or 'run_tests' in self.student_code:
+                    print("⚠️  WARNING: It looks like you executed the test cell twice!")
+                    print("📝 Please execute the PREVIOUS cell (with your solution code) first.")
+                    print("   Then run this test cell again.")
+                    return ""
+                
                 return self.student_code
             
             # Method 2: Use _i variable
             last_input = ipython.user_ns.get('_i', '')
             if last_input:
                 self.student_code = last_input
+                
+                # Check if the loaded code contains test framework code
+                if 'ColabTestFramework' in self.student_code or 'run_tests' in self.student_code:
+                    print("⚠️  WARNING: It looks like you executed the test cell twice!")
+                    print("📝 Please execute the PREVIOUS cell (with your solution code) first.")
+                    print("   Then run this test cell again.")
+                    return ""
+                
                 return last_input
             
             # Method 3: Use history manager
@@ -231,6 +247,14 @@ class ColabTestFramework:
             if history and len(history) >= 2:
                 # Get second to last entry
                 self.student_code = history[-2][2]
+                
+                # Check if the loaded code contains test framework code
+                if 'ColabTestFramework' in self.student_code or 'run_tests' in self.student_code:
+                    print("⚠️  WARNING: It looks like you executed the test cell twice!")
+                    print("📝 Please execute the PREVIOUS cell (with your solution code) first.")
+                    print("   Then run this test cell again.")
+                    return ""
+                
                 return self.student_code
             
             return ""
@@ -647,7 +671,11 @@ class ColabTestFramework:
             Results are also stored in self.results for later access.
         """
         self.results = []
-        self.load_last_cell()
+        code = self.load_last_cell()
+        
+        # If load_last_cell detected test cell executed twice, stop here
+        if not code:
+            return self.results
         
         for test in tests:
             if test.test_type == 'regex':
