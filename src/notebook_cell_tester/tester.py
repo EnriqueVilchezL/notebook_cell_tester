@@ -749,7 +749,16 @@ class ColabTestFramework:
             in notebook environments.
         """
         total = len(self.results)
+        
+        # Handle case where no tests were run
+        if total == 0:
+            print("⚠️  No tests were executed.")
+            print("📝 Make sure to execute the cell with your solution code first,")
+            print("   then run this test cell.")
+            return
+        
         passed = sum(1 for r in self.results if r.passed)
+        percentage = (passed/total*100)
         
         # Build HTML table
         html = f"""
@@ -810,7 +819,7 @@ class ColabTestFramework:
         </style>
         
         <div class="summary">
-            Test Results: {passed}/{total} passed ({(passed/total*100):.1f}%)
+            Test Results: {passed}/{total} passed ({percentage:.1f}%)
             {'🎉 All tests passed!' if passed == total else '⚠️ Some tests failed'}
         </div>
         
