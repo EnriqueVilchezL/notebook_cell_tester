@@ -31,9 +31,63 @@ import sys
 import io
 from contextlib import redirect_stdout, redirect_stderr
 from typing import List, Dict, Any, Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from IPython.display import HTML, display
 import traceback
+
+
+def levenshtein_similarity(s1: str, s2: str) -> float:
+    """Compute the Levenshtein similarity ratio between two strings.
+
+    Similarity is defined as::
+
+        1 - (edit_distance / max(len(s1), len(s2)))
+
+    so identical strings yield 1.0 and completely different strings of the
+    same length yield 0.0.  Both strings are compared after stripping leading
+    and trailing whitespace.
+
+    Args:
+        s1: First string.
+        s2: Second string.
+
+    Returns:
+        A float in [0.0, 1.0] representing the similarity ratio.
+
+    Examples:
+        >>> levenshtein_similarity("hello", "hello")
+        1.0
+        >>> levenshtein_similarity("kitten", "sitting")
+        0.5384615384615384
+        >>> levenshtein_similarity("", "")
+        1.0
+    """
+    s1 = s1.strip()
+    s2 = s2.strip()
+
+    if s1 == s2:
+        return 1.0
+
+    len1, len2 = len(s1), len(s2)
+
+    if len1 == 0 and len2 == 0:
+        return 1.0
+    if len1 == 0 or len2 == 0:
+        return 0.0
+
+    # Standard DP Levenshtein — O(len1 * len2) time, O(len2) space
+    prev = list(range(len2 + 1))
+    for i, c1 in enumerate(s1, 1):
+        curr = [i] + [0] * len2
+        for j, c2 in enumerate(s2, 1):
+            if c1 == c2:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+
+    distance = prev[len2]
+    return 1.0 - distance / max(len1, len2)
 
 
 @dataclass
@@ -41,37 +95,55 @@ class TestCase:
     """A test case for validating student code.
     
     This class supports multiple test types including function tests, cell output tests,
-    code pattern matching, and variable validation. The behavior changes based on which
-    parameters are provided.
+    code pattern matching, variable validation, and fuzzy output matching via
+    Levenshtein similarity.
     
     Args:
         name: Display name for the test shown in the results table.
         test_type: Type of test to perform. Options are:
-            - 'output': Test printed output (stdout)
-            - 'return': Test function return value
-            - 'exception': Test if function raises expected exception
-            - 'regex': Test if code matches a regex pattern
-            - 'not_regex': Test if code does NOT match a regex pattern
-            - 'variable': Test variable value using a validator function
-        function_name: Name of the function to test. If None, tests entire cell execution.
-            Required for function-level tests.
-        variable_name: Name of the variable to validate. Required when test_type='variable'.
+            - 'output': Test printed output (stdout) — exact match.
+            - 'return': Test function return value.
+            - 'exception': Test if function raises expected exception.
+            - 'regex': Test if code matches a regex pattern.
+            - 'not_regex': Test if code does NOT match a regex pattern.
+            - 'variable': Test variable value using a validator function.
+            - 'partial_output': Test printed output using Levenshtein similarity.
+              Passes when ``similarity >= similarity_threshold``.
+        function_name: Name of the function to test. If None, tests entire cell
+            execution.  Required for function-level tests.
+        variable_name: Name of the variable to validate. Required when
+            test_type='variable'.
         inputs: List of arguments to pass to the function. Used for function tests.
         stdin_input: String to provide as standard input (simulates input() function).
             Can contain multiple lines separated by '\\n'.
         expected: Expected value for comparison:
-            - For 'return' tests: Expected return value
-            - For 'output' tests: Expected printed output string
-            - For 'exception' tests: Expected exception type (e.g., ValueError)
-            - For 'variable' tests: Optional, used in error messages
+            - For 'return' tests: Expected return value.
+            - For 'output' / 'partial_output' tests: Expected printed output string.
+            - For 'exception' tests: Expected exception type (e.g., ValueError).
+            - For 'variable' tests: Optional, used in error messages.
+        similarity_threshold: Required for 'partial_output' tests.  A float in
+            (0.0, 1.0] representing the minimum Levenshtein similarity ratio for
+            the test to pass.  For example, ``0.8`` means the actual output must
+            be at least 80 % similar to the expected string.
         validator: Lambda or function to validate variable value. Must return bool.
             Required when test_type='variable'.
-        pattern: Regex pattern to match in code. Required when test_type='regex' or 'not_regex'.
+        pattern: Regex pattern to match in code. Required when test_type='regex'
+            or 'not_regex'.
         description: Additional description for the test (currently unused).
         error_message: Custom error message shown to students when test fails.
             For variable tests, use {value} placeholder for actual value.
     
     Examples:
+        Fuzzy output test — at least 80 % similar::
+        
+            TestCase(
+                name="Greet user (fuzzy)",
+                test_type="partial_output",
+                stdin_input="Alice",
+                expected="Hello, Alice!",
+                similarity_threshold=0.8
+            )
+        
         Test function return value::
         
             TestCase(
@@ -126,15 +198,28 @@ class TestCase:
     inputs: Optional[List[Any]] = None
     stdin_input: Optional[str] = None
     expected: Any = None
+    similarity_threshold: Optional[float] = None
     validator: Optional[Callable] = None
     pattern: Optional[str] = None
     description: str = ""
     error_message: str = ""
     
     def __post_init__(self):
-        """Initialize inputs to empty list if None."""
+        """Initialize inputs to empty list if None and validate partial_output config."""
         if self.inputs is None:
             self.inputs = []
+
+        if self.test_type == 'partial_output':
+            if self.similarity_threshold is None:
+                raise ValueError(
+                    f"TestCase '{self.name}': 'similarity_threshold' is required "
+                    "for test_type='partial_output'."
+                )
+            if not (0.0 < self.similarity_threshold <= 1.0):
+                raise ValueError(
+                    f"TestCase '{self.name}': 'similarity_threshold' must be in "
+                    f"(0.0, 1.0], got {self.similarity_threshold}."
+                )
 
 
 @dataclass
@@ -342,7 +427,108 @@ class ColabTestFramework:
                 f"Error executing cell",
                 str(e)
             )
-    
+
+    def test_partial_output(self, test_name: str, stdin_input: str,
+                            expected_output: str, similarity_threshold: float,
+                            function_name: Optional[str] = None,
+                            inputs: Optional[List[Any]] = None) -> TestResult:
+        """Test output using Levenshtein similarity instead of exact matching.
+
+        Captures the printed output produced either by running the whole cell or
+        by calling a specific function, then passes the test when the similarity
+        between the actual output and *expected_output* is greater than or equal
+        to *similarity_threshold*.
+
+        Similarity is computed with :func:`levenshtein_similarity`, which returns
+        a value in [0.0, 1.0] where 1.0 means identical strings.
+
+        Args:
+            test_name: Name of the test for display purposes.
+            stdin_input: String to provide as standard input.
+            expected_output: The output the student's code should approximately
+                produce.
+            similarity_threshold: Minimum similarity ratio (0.0, 1.0] required
+                to pass the test.  E.g. ``0.8`` → 80 % similar.
+            function_name: If provided, call this function instead of running
+                the whole cell.
+            inputs: Arguments to pass to *function_name* (ignored for cell tests).
+
+        Returns:
+            TestResult with pass/fail status, the computed similarity percentage,
+            and the threshold that was required.
+
+        Examples:
+            Cell-level fuzzy output test::
+
+                result = tester.test_partial_output(
+                    test_name="Greeting (fuzzy)",
+                    stdin_input="Alice",
+                    expected_output="Hello, Alice!",
+                    similarity_threshold=0.8
+                )
+
+            Function-level fuzzy output test::
+
+                result = tester.test_partial_output(
+                    test_name="greet() fuzzy",
+                    stdin_input="",
+                    expected_output="Hello, Alice!",
+                    similarity_threshold=0.9,
+                    function_name="greet",
+                    inputs=["Alice"]
+                )
+        """
+        inputs = inputs or []
+
+        try:
+            old_stdin = sys.stdin
+            sys.stdin = io.StringIO(stdin_input)
+            captured = io.StringIO()
+
+            try:
+                with redirect_stdout(captured):
+                    if function_name:
+                        func = get_ipython().user_ns.get(function_name)
+                        if func is None:
+                            return TestResult(
+                                test_name, False,
+                                f"Function '{function_name}' not found", None
+                            )
+                        func(*inputs)
+                    else:
+                        exec_namespace = {
+                            '__builtins__': __builtins__,
+                            'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
+                        }
+                        exec(self.student_code, exec_namespace)
+            finally:
+                sys.stdin = old_stdin
+
+            output = captured.getvalue().strip()
+            expected = expected_output.strip()
+            similarity = levenshtein_similarity(output, expected)
+            passed = similarity >= similarity_threshold
+
+            output_display = f"'{output}'" if output else "Nothing printed"
+            expected_display = f"'{expected}'" if expected else "Nothing"
+            threshold_pct = f"{similarity_threshold * 100:.1f}%"
+            similarity_pct = f"{similarity * 100:.1f}%"
+
+            message = (
+                f"Expected (≥{threshold_pct} similar): {expected_display} | "
+                f"Got: {output_display} | "
+                f"Similarity: {similarity_pct}"
+            )
+            return TestResult(test_name, passed, message, None)
+
+        except Exception as e:
+            sys.stdin = old_stdin
+            return TestResult(
+                test_name, False,
+                "Error executing partial_output test",
+                str(e)
+            )
+
     def test_function(self, test_name: str, func_name: str, test_type: str, 
                      inputs: List[Any], stdin_input: str, expected: Any) -> TestResult:
         """Test a specific function with various test types.
@@ -729,6 +915,16 @@ class ColabTestFramework:
                     test.validator,
                     test.expected,
                     test.error_message
+                )
+            elif test.test_type == 'partial_output':
+                # Fuzzy output test using Levenshtein similarity
+                result = self.test_partial_output(
+                    test.name,
+                    test.stdin_input or "",
+                    test.expected,
+                    test.similarity_threshold,
+                    function_name=test.function_name,
+                    inputs=test.inputs,
                 )
             elif test.test_type == 'output' and not test.function_name:
                 # Cell output test (no function specified)
