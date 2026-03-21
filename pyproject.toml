@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "notebook-cell-tester"
-version = "1.3.0"
+version = "1.4.0"
 description = "A simple example Python package"
 readme = "README.md"
 authors = [{ name = "Enrique Vílchez Lizano", email = "enriquevil0705@gmail.com" }]
