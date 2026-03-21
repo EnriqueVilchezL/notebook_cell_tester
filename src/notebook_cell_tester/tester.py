@@ -90,137 +90,6 @@ def levenshtein_similarity(s1: str, s2: str) -> float:
     return 1.0 - distance / max(len1, len2)
 
 
-@dataclass
-class TestCase:
-    """A test case for validating student code.
-    
-    This class supports multiple test types including function tests, cell output tests,
-    code pattern matching, variable validation, and fuzzy output matching via
-    Levenshtein similarity.
-    
-    Args:
-        name: Display name for the test shown in the results table.
-        test_type: Type of test to perform. Options are:
-            - 'output': Test printed output (stdout) — exact match.
-            - 'return': Test function return value.
-            - 'exception': Test if function raises expected exception.
-            - 'regex': Test if code matches a regex pattern.
-            - 'not_regex': Test if code does NOT match a regex pattern.
-            - 'variable': Test variable value using a validator function.
-            - 'partial_output': Test printed output using Levenshtein similarity.
-              Passes when ``similarity >= similarity_threshold``.
-        function_name: Name of the function to test. If None, tests entire cell
-            execution.  Required for function-level tests.
-        variable_name: Name of the variable to validate. Required when
-            test_type='variable'.
-        inputs: List of arguments to pass to the function. Used for function tests.
-        stdin_input: String to provide as standard input (simulates input() function).
-            Can contain multiple lines separated by '\\n'.
-        expected: Expected value for comparison:
-            - For 'return' tests: Expected return value.
-            - For 'output' / 'partial_output' tests: Expected printed output string.
-            - For 'exception' tests: Expected exception type (e.g., ValueError).
-            - For 'variable' tests: Optional, used in error messages.
-        similarity_threshold: Required for 'partial_output' tests.  A float in
-            (0.0, 1.0] representing the minimum Levenshtein similarity ratio for
-            the test to pass.  For example, ``0.8`` means the actual output must
-            be at least 80 % similar to the expected string.
-        validator: Lambda or function to validate variable value. Must return bool.
-            Required when test_type='variable'.
-        pattern: Regex pattern to match in code. Required when test_type='regex'
-            or 'not_regex'.
-        description: Additional description for the test (currently unused).
-        error_message: Custom error message shown to students when test fails.
-            For variable tests, use {value} placeholder for actual value.
-    
-    Examples:
-        Fuzzy output test — at least 80 % similar::
-        
-            TestCase(
-                name="Greet user (fuzzy)",
-                test_type="partial_output",
-                stdin_input="Alice",
-                expected="Hello, Alice!",
-                similarity_threshold=0.8
-            )
-        
-        Test function return value::
-        
-            TestCase(
-                name="Addition with positive numbers",
-                test_type="return",
-                function_name="add_numbers",
-                inputs=[2, 3],
-                expected=5
-            )
-        
-        Test cell output with stdin::
-        
-            TestCase(
-                name="Greet user",
-                test_type="output",
-                stdin_input="Alice",
-                expected="Hello, Alice!"
-            )
-        
-        Test code pattern exists::
-        
-            TestCase(
-                name="Uses for loop",
-                test_type="regex",
-                pattern=r"for\s+\w+\s+in\s+",
-                error_message="Your code must use a for loop"
-            )
-        
-        Test code pattern does NOT exist::
-        
-            TestCase(
-                name="Does not use global variables",
-                test_type="not_regex",
-                pattern=r"global\s+\w+",
-                error_message="Your code should not use global variables"
-            )
-        
-        Test variable validation::
-        
-            TestCase(
-                name="Age is positive",
-                test_type="variable",
-                variable_name="age",
-                validator=lambda x: x > 0,
-                error_message="Variable 'age' must be positive, got {value}"
-            )
-    """
-    name: str
-    test_type: str
-    function_name: Optional[str] = None
-    variable_name: Optional[str] = None
-    inputs: Optional[List[Any]] = None
-    stdin_input: Optional[str] = None
-    expected: Any = None
-    similarity_threshold: Optional[float] = None
-    validator: Optional[Callable] = None
-    pattern: Optional[str] = None
-    description: str = ""
-    error_message: str = ""
-    
-    def __post_init__(self):
-        """Initialize inputs to empty list if None and validate partial_output config."""
-        if self.inputs is None:
-            self.inputs = []
-
-        if self.test_type == 'partial_output':
-            if self.similarity_threshold is None:
-                raise ValueError(
-                    f"TestCase '{self.name}': 'similarity_threshold' is required "
-                    "for test_type='partial_output'."
-                )
-            if not (0.0 < self.similarity_threshold <= 1.0):
-                raise ValueError(
-                    f"TestCase '{self.name}': 'similarity_threshold' must be in "
-                    f"(0.0, 1.0], got {self.similarity_threshold}."
-                )
-
 
 @dataclass
 class TestResult:
@@ -526,6 +395,100 @@ class ColabTestFramework:
             return TestResult(
                 test_name, False,
                 "Error executing partial_output test",
+                str(e)
+            )
+
+    def test_regex_output(self, test_name: str, stdin_input: str, pattern: str,
+                          error_message: str = "",
+                          function_name: Optional[str] = None,
+                          inputs: Optional[List[Any]] = None) -> TestResult:
+        """Test that the printed output matches a regex pattern.
+
+        Captures stdout produced by running the whole cell or by calling a
+        specific function, then checks whether *pattern* can be found anywhere
+        in that output using :func:`re.search`.
+
+        Args:
+            test_name: Name of the test for display purposes.
+            stdin_input: String to provide as standard input.
+            pattern: Regex pattern to search for in the captured output.
+                Uses ``re.MULTILINE | re.DOTALL`` flags.
+            error_message: Custom message shown when the test fails.  If empty,
+                a default message with the pattern and actual output is shown.
+            function_name: If provided, call this function instead of running
+                the whole cell.
+            inputs: Arguments to pass to *function_name* (ignored for cell tests).
+
+        Returns:
+            TestResult indicating whether the pattern was found in the output.
+
+        Examples:
+            Check that a float appears anywhere in cell output::
+
+                TestCase(
+                    name="Output contains a float",
+                    test_type="regex_output",
+                    pattern=r"\\d+\\.\\d+",
+                    error_message="Expected a float value in the output"
+                )
+
+            Check that a function prints a greeting::
+
+                TestCase(
+                    name="greet() prints Hello",
+                    test_type="regex_output",
+                    function_name="greet",
+                    inputs=["Alice"],
+                    pattern=r"Hello.*Alice",
+                    error_message="Expected 'Hello ... Alice' in output"
+                )
+        """
+        inputs = inputs or []
+
+        try:
+            old_stdin = sys.stdin
+            sys.stdin = io.StringIO(stdin_input)
+            captured = io.StringIO()
+
+            try:
+                with redirect_stdout(captured):
+                    if function_name:
+                        func = get_ipython().user_ns.get(function_name)
+                        if func is None:
+                            return TestResult(
+                                test_name, False,
+                                f"Function '{function_name}' not found", None
+                            )
+                        func(*inputs)
+                    else:
+                        exec_namespace = {
+                            '__builtins__': __builtins__,
+                            'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
+                        }
+                        exec(self.student_code, exec_namespace)
+            finally:
+                sys.stdin = old_stdin
+
+            output = captured.getvalue().strip()
+            match = re.search(pattern, output, re.MULTILINE | re.DOTALL)
+            passed = match is not None
+
+            if passed:
+                message = f"Pattern '{pattern}' found in output"
+            else:
+                if error_message:
+                    message = error_message
+                else:
+                    output_display = f"'{output}'" if output else "Nothing printed"
+                    message = f"Pattern '{pattern}' not found in output | Got: {output_display}"
+
+            return TestResult(test_name, passed, message, None)
+
+        except Exception as e:
+            sys.stdin = old_stdin
+            return TestResult(
+                test_name, False,
+                "Error executing regex_output test",
                 str(e)
             )
 
@@ -923,6 +886,16 @@ class ColabTestFramework:
                     test.stdin_input or "",
                     test.expected,
                     test.similarity_threshold,
+                    function_name=test.function_name,
+                    inputs=test.inputs,
+                )
+            elif test.test_type == 'regex_output':
+                # Regex pattern search in captured output
+                result = self.test_regex_output(
+                    test.name,
+                    test.stdin_input or "",
+                    test.pattern,
+                    test.error_message,
                     function_name=test.function_name,
                     inputs=test.inputs,
                 )
