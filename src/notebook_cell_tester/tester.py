@@ -92,6 +92,113 @@ def levenshtein_similarity(s1: str, s2: str) -> float:
 
 
 @dataclass
+class TestCase:
+    """A test case for validating student code.
+
+    Args:
+        name: Display name for the test shown in the results table.
+        test_type: Type of test to perform. Options are:
+
+            - ``'output'``: Test printed output (stdout) — exact match.
+            - ``'return'``: Test function return value.
+            - ``'exception'``: Test if function raises expected exception.
+            - ``'regex'``: Test if *source code* matches a regex pattern.
+            - ``'not_regex'``: Test if *source code* does NOT match a regex pattern.
+            - ``'variable'``: Test variable value using a validator function.
+            - ``'partial_output'``: Test printed output via Levenshtein similarity.
+              Passes when ``similarity >= similarity_threshold``.
+            - ``'regex_output'``: Test that printed output matches a regex pattern.
+
+        function_name: Name of the function to test. If None, tests entire cell
+            execution. Required for function-level tests.
+        variable_name: Name of the variable to validate. Required when
+            ``test_type='variable'``.
+        inputs: List of arguments to pass to the function.
+        stdin_input: String to provide as standard input (simulates ``input()``).
+            Multiple lines separated by ``'\\n'``.
+        expected: Expected value for comparison:
+
+            - ``'return'``: Expected return value.
+            - ``'output'`` / ``'partial_output'``: Expected printed output string.
+            - ``'exception'``: Expected exception type (e.g. ``ValueError``).
+            - ``'variable'``: Optional, used in error messages.
+
+        similarity_threshold: Required for ``'partial_output'``. Float in ``(0.0, 1.0]``
+            representing the minimum Levenshtein similarity ratio to pass.
+        validator: Callable that takes the variable value and returns ``bool``.
+            Required when ``test_type='variable'``.
+        pattern: Regex pattern. Required for ``'regex'``, ``'not_regex'``, and
+            ``'regex_output'`` tests.
+        description: Additional description (currently unused).
+        error_message: Custom message shown when the test fails.
+            For variable tests, use ``{value}`` as a placeholder.
+
+    Examples:
+        Regex pattern in output::
+
+            TestCase(
+                name="Output contains a float",
+                test_type="regex_output",
+                pattern=r"\\d+\\.\\d+",
+                error_message="Expected a float value in the output"
+            )
+
+        Fuzzy output match::
+
+            TestCase(
+                name="Greet user (fuzzy)",
+                test_type="partial_output",
+                stdin_input="Alice",
+                expected="Hello, Alice!",
+                similarity_threshold=0.8
+            )
+
+        Function return value::
+
+            TestCase(
+                name="Addition",
+                test_type="return",
+                function_name="add_numbers",
+                inputs=[2, 3],
+                expected=5
+            )
+    """
+    name: str
+    test_type: str
+    function_name: Optional[str] = None
+    variable_name: Optional[str] = None
+    inputs: Optional[List[Any]] = None
+    stdin_input: Optional[str] = None
+    expected: Any = None
+    similarity_threshold: Optional[float] = None
+    validator: Optional[Callable] = None
+    pattern: Optional[str] = None
+    description: str = ""
+    error_message: str = ""
+
+    def __post_init__(self):
+        """Validate fields and apply defaults."""
+        if self.inputs is None:
+            self.inputs = []
+        if self.test_type == 'partial_output':
+            if self.similarity_threshold is None:
+                raise ValueError(
+                    f"TestCase '{self.name}': 'similarity_threshold' is required "
+                    "for test_type='partial_output'."
+                )
+            if not (0.0 < self.similarity_threshold <= 1.0):
+                raise ValueError(
+                    f"TestCase '{self.name}': 'similarity_threshold' must be in "
+                    f"(0.0, 1.0], got {self.similarity_threshold}."
+                )
+        if self.test_type in ('regex', 'not_regex', 'regex_output') and self.pattern is None:
+            raise ValueError(
+                f"TestCase '{self.name}': 'pattern' is required for "
+                f"test_type='{self.test_type}'."
+            )
+
+
+@dataclass
 class TestResult:
     """Result of a single test execution.
     
