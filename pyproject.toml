@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "notebook-cell-tester"
-version = "1.5.0"
+version = "1.5.1"
 description = "Automatic grading framework for student code in Google Colab and Jupyter notebooks"
 readme = "README.md"
 authors = [{ name = "Enrique Vílchez Lizano", email = "enriquevil0705@gmail.com" }]
