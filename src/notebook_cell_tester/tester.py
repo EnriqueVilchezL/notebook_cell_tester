@@ -144,6 +144,9 @@ class TestCase:
             in the results table so students understand the purpose of each test.
         error_message: Custom message shown when the test fails.
             For variable tests, use ``{value}`` as a placeholder.
+        success_message: Optional custom message shown when the test passes.
+            When set, replaces the default pass message so students see this
+            text instead of the technical expected/got details.
 
     Examples:
         Regex pattern in output::
@@ -219,6 +222,7 @@ class TestCase:
     pattern: Optional[str] = None
     description: str = ""
     error_message: str = ""
+    success_message: str = ""
 
     def __post_init__(self):
         """Validate fields and apply defaults."""
@@ -1183,6 +1187,8 @@ class ColabTestFramework:
             )
 
         result.description = test.description
+        if result.passed and test.success_message:
+            result.message = test.success_message
         return result
 
     def run_tests(self, tests: List[TestCase]) -> List[TestResult]:

@@ -403,6 +403,7 @@ tester.display_results()
 | `pattern` | `str` | `regex`, `not_regex`, `regex_output` | Python regex string |
 | `description` | `str` | optional on all | Shown as an italic subtitle under the test name |
 | `error_message` | `str` | optional on all | Custom failure message; use `{value}` placeholder in `variable` tests |
+| `success_message` | `str` | optional on all | Custom message shown when the test passes; replaces the default pass message |
 
 ---
 
@@ -483,6 +484,24 @@ tests = [
     ),
 ]
 ```
+
+### Custom pass and fail messages
+
+Use `success_message` to replace the default technical pass message with something more encouraging, and `error_message` to give students a clear hint on failure:
+
+```python
+TestCase(
+    name="factorial(5) == 120",
+    test_type="return",
+    function_name="factorial",
+    inputs=[5],
+    expected=120,
+    success_message="Correct! Your factorial function works perfectly.",
+    error_message="Check your base case and recursive step.",
+)
+```
+
+---
 
 ### Flexible output with `partial_output`
 

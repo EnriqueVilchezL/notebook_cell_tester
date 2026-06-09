@@ -57,6 +57,7 @@ Everything lives in a single file: `src/notebook_cell_tester/tester.py`.
 | `pattern` | `str` | `regex`, `not_regex`, `regex_output` | Python regex string |
 | `description` | `str` | optional on all | Shown as italic subtitle under test name in the results table |
 | `error_message` | `str` | optional on all | Custom failure message; use `{value}` placeholder in `variable` tests |
+| `success_message` | `str` | optional on all | Custom message shown when the test passes; replaces the default pass message |
 
 ---
 
