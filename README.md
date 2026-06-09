@@ -26,6 +26,7 @@ Instructors drop a single test cell below the student's code cell. The framework
   - [regex_output — stdout regex](#regex_output--stdout-regex)
   - [contains_output — stdout substring](#contains_output--stdout-substring)
   - [multiline_output — order-independent lines](#multiline_output--order-independent-lines)
+- [Sections](#sections)
 - [TestCase field reference](#testcase-field-reference)
 - [Results display](#results-display)
 - [Common patterns](#common-patterns)
@@ -334,6 +335,57 @@ TestCase(
 
 ---
 
+## Sections
+
+Use `TestSection` to group tests into named blocks, each rendered as a separate table with its own header. Import it alongside `ColabTestFramework` and `TestCase`, then call `run_sections()` instead of `run_tests()`.
+
+```python
+from notebook_cell_tester import ColabTestFramework, TestCase, TestSection
+
+tester = ColabTestFramework()
+
+tester.run_sections([
+    TestSection("Part 1: Code structure", [
+        TestCase(
+            name="Uses a for loop",
+            test_type="regex",
+            pattern=r"\bfor\b",
+            description="Your solution must iterate with a for loop.",
+        ),
+        TestCase(
+            name="Does not use sum()",
+            test_type="not_regex",
+            pattern=r"\bsum\s*\(",
+            error_message="Implement the summation manually — do not call sum().",
+        ),
+    ]),
+    TestSection("Part 2: Correctness", [
+        TestCase(
+            name="total([1, 2, 3]) == 6",
+            test_type="return",
+            function_name="total",
+            inputs=[[1, 2, 3]],
+            expected=6,
+        ),
+        TestCase(
+            name="total([]) == 0",
+            test_type="return",
+            function_name="total",
+            inputs=[[]],
+            expected=0,
+        ),
+    ]),
+])
+
+tester.display_results()
+```
+
+`display_results()` automatically detects that sections were used and renders a **named header bar** above each group showing the section title and its own `n/total passed` count, followed by an overall summary banner at the top.
+
+`run_tests()` with a flat list continues to work exactly as before — sections are opt-in.
+
+---
+
 ## TestCase field reference
 
 | Field | Type | Required for | Notes |
@@ -359,6 +411,7 @@ TestCase(
 `display_results()` renders an HTML table inside the notebook:
 
 - **Summary banner** — gradient bar showing `passed / total (%)` with a congratulatory message when all tests pass.
+- **Section headers** *(when using `run_sections()`)* — a purple gradient bar above each group showing the section name and its own `n/total passed` count.
 - **Status column** — green `✓ PASS` or red `✗ FAIL` badge per test row.
 - **Test column** — test name, with `description` shown as a small italic subtitle when set.
 - **Details column** — human-readable message (expected vs. actual values, similarity percentages, missing lines, etc.).

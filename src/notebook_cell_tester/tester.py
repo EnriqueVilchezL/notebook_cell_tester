@@ -287,6 +287,28 @@ class TestCase:
 
 
 @dataclass
+class TestSection:
+    """A named group of test cases rendered as a separate table section.
+
+    Args:
+        name: Section heading displayed above the table.
+        tests: List of TestCase objects belonging to this section.
+
+    Examples:
+        Grouping tests by topic::
+
+            sections = [
+                TestSection("Part 1: Input handling", [test1, test2]),
+                TestSection("Part 2: Computation", [test3, test4]),
+            ]
+            tester.run_sections(sections)
+            tester.display_results()
+    """
+    name: str
+    tests: List['TestCase']
+
+
+@dataclass
 class TestResult:
     """Result of a single test execution.
 
@@ -344,6 +366,7 @@ class ColabTestFramework:
     def __init__(self):
         """Initialize the testing framework with empty results and code."""
         self.results: List[TestResult] = []
+        self.section_results: List[tuple] = []  # List of (section_name, List[TestResult])
         self.student_code = ""
 
     def load_last_cell(self) -> str:
@@ -1098,6 +1121,70 @@ class ColabTestFramework:
                 traceback.format_exc()
             )
 
+    def _dispatch_test(self, test: TestCase, code_loaded: bool) -> Optional[TestResult]:
+        """Dispatch a single TestCase to the appropriate test method.
+
+        Returns None when code_loaded is False and the test requires student source.
+        """
+        _namespace_only = {'variable', 'type_check'}
+
+        if not code_loaded and test.test_type not in _namespace_only:
+            return None
+
+        if test.test_type == 'regex':
+            result = self.test_code_pattern(
+                test.name, test.pattern, test.description, test.error_message, negate=False
+            )
+        elif test.test_type == 'not_regex':
+            result = self.test_code_pattern(
+                test.name, test.pattern, test.description, test.error_message, negate=True
+            )
+        elif test.test_type == 'variable':
+            result = self.test_variable(
+                test.name, test.variable_name, test.validator, test.expected, test.error_message
+            )
+        elif test.test_type == 'partial_output':
+            result = self.test_partial_output(
+                test.name, test.stdin_input or "", test.expected, test.similarity_threshold,
+                function_name=test.function_name, inputs=test.inputs,
+            )
+        elif test.test_type == 'regex_output':
+            result = self.test_regex_output(
+                test.name, test.stdin_input or "", test.pattern, test.error_message,
+                function_name=test.function_name, inputs=test.inputs,
+            )
+        elif test.test_type == 'contains_output':
+            result = self.test_contains_output(
+                test.name, test.stdin_input or "", test.expected,
+                function_name=test.function_name, inputs=test.inputs,
+            )
+        elif test.test_type == 'multiline_output':
+            result = self.test_multiline_output(
+                test.name, test.stdin_input or "", test.expected,
+                function_name=test.function_name, inputs=test.inputs,
+            )
+        elif test.test_type == 'type_check':
+            result = self.test_type_check(
+                test.name, test.expected,
+                function_name=test.function_name, inputs=test.inputs,
+                variable_name=test.variable_name
+            )
+        elif test.test_type == 'output' and not test.function_name:
+            result = self.test_cell_output(test.name, test.stdin_input or "", test.expected)
+        elif test.function_name:
+            result = self.test_function(
+                test.name, test.function_name, test.test_type, test.inputs,
+                test.stdin_input or "", test.expected, tolerance=test.tolerance
+            )
+        else:
+            result = TestResult(
+                test.name, False,
+                f"Invalid test configuration for test type '{test.test_type}'", None
+            )
+
+        result.description = test.description
+        return result
+
     def run_tests(self, tests: List[TestCase]) -> List[TestResult]:
         """Run all tests and store results.
 
@@ -1116,262 +1203,66 @@ class ColabTestFramework:
             Results are also stored in self.results for later access.
         """
         self.results = []
+        self.section_results = []
         code = self.load_last_cell()
-
-        # Tests that only need the IPython namespace, not the cell source
-        _namespace_only = {'variable', 'type_check'}
-
-        # If cell code could not be loaded, only run namespace-only tests
-        if not code:
-            for test in tests:
-                if test.test_type not in _namespace_only:
-                    continue
-                if test.test_type == 'variable':
-                    result = self.test_variable(
-                        test.name,
-                        test.variable_name,
-                        test.validator,
-                        test.expected,
-                        test.error_message
-                    )
-                elif test.test_type == 'type_check':
-                    result = self.test_type_check(
-                        test.name,
-                        test.expected,
-                        function_name=test.function_name,
-                        inputs=test.inputs,
-                        variable_name=test.variable_name
-                    )
-                result.description = test.description
-                self.results.append(result)
-            return self.results
+        code_loaded = bool(code)
 
         for test in tests:
-            if test.test_type == 'regex':
-                result = self.test_code_pattern(
-                    test.name,
-                    test.pattern,
-                    test.description,
-                    test.error_message,
-                    negate=False
-                )
-            elif test.test_type == 'not_regex':
-                result = self.test_code_pattern(
-                    test.name,
-                    test.pattern,
-                    test.description,
-                    test.error_message,
-                    negate=True
-                )
-            elif test.test_type == 'variable':
-                result = self.test_variable(
-                    test.name,
-                    test.variable_name,
-                    test.validator,
-                    test.expected,
-                    test.error_message
-                )
-            elif test.test_type == 'partial_output':
-                result = self.test_partial_output(
-                    test.name,
-                    test.stdin_input or "",
-                    test.expected,
-                    test.similarity_threshold,
-                    function_name=test.function_name,
-                    inputs=test.inputs,
-                )
-            elif test.test_type == 'regex_output':
-                result = self.test_regex_output(
-                    test.name,
-                    test.stdin_input or "",
-                    test.pattern,
-                    test.error_message,
-                    function_name=test.function_name,
-                    inputs=test.inputs,
-                )
-            elif test.test_type == 'contains_output':
-                result = self.test_contains_output(
-                    test.name,
-                    test.stdin_input or "",
-                    test.expected,
-                    function_name=test.function_name,
-                    inputs=test.inputs,
-                )
-            elif test.test_type == 'multiline_output':
-                result = self.test_multiline_output(
-                    test.name,
-                    test.stdin_input or "",
-                    test.expected,
-                    function_name=test.function_name,
-                    inputs=test.inputs,
-                )
-            elif test.test_type == 'type_check':
-                result = self.test_type_check(
-                    test.name,
-                    test.expected,
-                    function_name=test.function_name,
-                    inputs=test.inputs,
-                    variable_name=test.variable_name
-                )
-            elif test.test_type == 'output' and not test.function_name:
-                result = self.test_cell_output(
-                    test.name,
-                    test.stdin_input or "",
-                    test.expected
-                )
-            elif test.function_name:
-                result = self.test_function(
-                    test.name,
-                    test.function_name,
-                    test.test_type,
-                    test.inputs,
-                    test.stdin_input or "",
-                    test.expected,
-                    tolerance=test.tolerance
-                )
-            else:
-                result = TestResult(
-                    test.name,
-                    False,
-                    f"Invalid test configuration for test type '{test.test_type}'",
-                    None
-                )
-
-            result.description = test.description
-            self.results.append(result)
+            result = self._dispatch_test(test, code_loaded)
+            if result is not None:
+                self.results.append(result)
 
         return self.results
 
-    def display_results(self):
-        """Display test results in a colorful HTML table.
+    def run_sections(self, sections: List[TestSection]) -> List[TestResult]:
+        """Run grouped tests and store results by section.
 
-        Renders all test results in a formatted HTML table with color-coded
-        pass/fail status, summary statistics, and detailed messages for each test.
+        Loads the student's code once, then executes each section's tests in order.
+        Results are stored both in ``self.section_results`` (grouped) and
+        ``self.results`` (flat list) so that ``display_results()`` renders the
+        sectioned view automatically.
 
-        The table includes:
-            - Summary bar showing total passed/failed and percentage
-            - Status column with green (pass) or red (fail) indicators
-            - Test name column (with optional description subtitle)
-            - Details column with expected vs actual values
-            - Collapsible technical error details when applicable
+        Args:
+            sections: List of TestSection objects, each with a name and test list.
 
-        Note:
-            This method uses IPython's display functionality and will only work
-            in notebook environments.
+        Returns:
+            Flat list of all TestResult objects across all sections.
+
+        Examples:
+            ::
+
+                tester = ColabTestFramework()
+                tester.run_sections([
+                    TestSection("Part 1: Basics", [test1, test2]),
+                    TestSection("Part 2: Edge cases", [test3]),
+                ])
+                tester.display_results()
         """
-        total = len(self.results)
+        self.results = []
+        self.section_results = []
+        code = self.load_last_cell()
+        code_loaded = bool(code)
 
-        # Handle case where no tests were run
-        if total == 0:
-            print("⚠️  No tests were executed.")
-            print("📝 Make sure to execute the cell with your solution code first,")
-            print("   then run this test cell.")
-            return
+        for section in sections:
+            section_res: List[TestResult] = []
+            for test in section.tests:
+                result = self._dispatch_test(test, code_loaded)
+                if result is not None:
+                    section_res.append(result)
+                    self.results.append(result)
+            self.section_results.append((section.name, section_res))
 
-        passed = sum(1 for r in self.results if r.passed)
-        percentage = (passed / total * 100)
+        return self.results
 
-        # Build HTML table
-        html = f"""
-        <style>
-            .test-results {{
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                border-collapse: collapse;
-                width: 100%;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                margin: 20px 0;
-            }}
-            .test-results th {{
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                padding: 15px;
-                text-align: left;
-                font-weight: 600;
-                font-size: 14px;
-            }}
-            .test-results td {{
-                padding: 12px 15px;
-                border-bottom: 1px solid #e0e0e0;
-                font-size: 13px;
-                vertical-align: top;
-            }}
-            .test-results tr:hover {{
-                background-color: #f8f9fa;
-            }}
-            .status-pass {{
-                background-color: #d4edda;
-                color: #155724;
-                font-weight: bold;
-                text-align: center;
-                border-radius: 4px;
-            }}
-            .status-fail {{
-                background-color: #f8d7da;
-                color: #721c24;
-                font-weight: bold;
-                text-align: center;
-                border-radius: 4px;
-            }}
-            .summary {{
-                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-                color: white;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 20px 0;
-                font-size: 16px;
-                font-weight: 600;
-                text-align: center;
-            }}
-            .test-description {{
-                color: #6c757d;
-                font-size: 11px;
-                font-style: italic;
-                margin-top: 3px;
-            }}
-            .error-details summary {{
-                cursor: pointer;
-                color: #c0392b;
-                font-size: 12px;
-                margin-top: 6px;
-                user-select: none;
-            }}
-            .error-details pre {{
-                font-size: 11px;
-                color: #721c24;
-                white-space: pre-wrap;
-                word-break: break-word;
-                background: #fff5f5;
-                border: 1px solid #f5c6cb;
-                border-radius: 4px;
-                padding: 8px;
-                margin: 6px 0 0 0;
-            }}
-        </style>
-
-        <div class="summary">
-            Test Results: {passed}/{total} passed ({percentage:.1f}%)
-            {'🎉 All tests passed!' if passed == total else '⚠️ Some tests failed — review the details below.'}
-        </div>
-
-        <table class="test-results">
-            <thead>
-                <tr>
-                    <th style="width: 10%;">Status</th>
-                    <th style="width: 30%;">Test</th>
-                    <th style="width: 60%;">Details</th>
-                </tr>
-            </thead>
-            <tbody>
-        """
-
-        for result in self.results:
+    def _results_table_rows(self, results: List[TestResult]) -> str:
+        """Return the HTML <tr> rows for a list of TestResult objects."""
+        rows = ""
+        for result in results:
             status_class = "status-pass" if result.passed else "status-fail"
             status_text = "✓ PASS" if result.passed else "✗ FAIL"
 
-            # Escape HTML in message to prevent injection
             safe_message = html_module.escape(result.message).replace('\n', '<br>')
 
-            # Collapsible error details
             error_html = ""
             if result.error:
                 safe_error = html_module.escape(result.error)
@@ -1388,17 +1279,181 @@ class ColabTestFramework:
                     f'<div class="test-description">{html_module.escape(result.description)}</div>'
                 )
 
-            html += f"""
+            rows += f"""
                 <tr>
                     <td class="{status_class}">{status_text}</td>
                     <td>{html_module.escape(result.test_name)}{description_html}</td>
                     <td>{safe_message}{error_html}</td>
                 </tr>
             """
+        return rows
 
-        html += """
+    def display_results(self):
+        """Display test results in a colorful HTML table.
+
+        Renders all test results in a formatted HTML table with color-coded
+        pass/fail status, summary statistics, and detailed messages for each test.
+
+        When ``run_sections()`` was used, each section is rendered as a separate
+        table under its own named header. Otherwise a single flat table is shown.
+
+        The table includes:
+            - Summary bar showing total passed/failed and percentage
+            - Status column with green (pass) or red (fail) indicators
+            - Test name column (with optional description subtitle)
+            - Details column with expected vs actual values
+            - Collapsible technical error details when applicable
+
+        Note:
+            This method uses IPython's display functionality and will only work
+            in notebook environments.
+        """
+        total = len(self.results)
+
+        if total == 0:
+            print("⚠️  No tests were executed.")
+            print("📝 Make sure to execute the cell with your solution code first,")
+            print("   then run this test cell.")
+            return
+
+        passed = sum(1 for r in self.results if r.passed)
+        percentage = (passed / total * 100)
+
+        shared_styles = """
+        <style>
+            .test-results {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                border-collapse: collapse;
+                width: 100%;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                margin: 12px 0 24px 0;
+            }
+            .test-results th {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 15px;
+                text-align: left;
+                font-weight: 600;
+                font-size: 14px;
+            }
+            .test-results td {
+                padding: 12px 15px;
+                border-bottom: 1px solid #e0e0e0;
+                font-size: 13px;
+                vertical-align: top;
+            }
+            .test-results tr:hover {
+                background-color: #f8f9fa;
+            }
+            .status-pass {
+                background-color: #d4edda;
+                color: #155724;
+                font-weight: bold;
+                text-align: center;
+                border-radius: 4px;
+            }
+            .status-fail {
+                background-color: #f8d7da;
+                color: #721c24;
+                font-weight: bold;
+                text-align: center;
+                border-radius: 4px;
+            }
+            .summary {
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                color: white;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 20px 0 16px 0;
+                font-size: 16px;
+                font-weight: 600;
+                text-align: center;
+            }
+            .section-header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 10px 16px;
+                border-radius: 6px;
+                margin: 20px 0 0 0;
+                font-size: 15px;
+                font-weight: 600;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .section-badge {
+                font-size: 12px;
+                font-weight: 500;
+                opacity: 0.9;
+            }
+            .test-description {
+                color: #6c757d;
+                font-size: 11px;
+                font-style: italic;
+                margin-top: 3px;
+            }
+            .error-details summary {
+                cursor: pointer;
+                color: #c0392b;
+                font-size: 12px;
+                margin-top: 6px;
+                user-select: none;
+            }
+            .error-details pre {
+                font-size: 11px;
+                color: #721c24;
+                white-space: pre-wrap;
+                word-break: break-word;
+                background: #fff5f5;
+                border: 1px solid #f5c6cb;
+                border-radius: 4px;
+                padding: 8px;
+                margin: 6px 0 0 0;
+            }
+        </style>
+        """
+
+        summary_html = f"""
+        <div class="summary">
+            Test Results: {passed}/{total} passed ({percentage:.1f}%)
+            {'🎉 All tests passed!' if passed == total else '⚠️ Some tests failed — review the details below.'}
+        </div>
+        """
+
+        table_header = """
+        <table class="test-results">
+            <thead>
+                <tr>
+                    <th style="width: 10%;">Status</th>
+                    <th style="width: 30%;">Test</th>
+                    <th style="width: 60%;">Details</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        table_footer = """
             </tbody>
         </table>
         """
+
+        if self.section_results:
+            html = shared_styles + summary_html
+            for section_name, section_res in self.section_results:
+                sec_passed = sum(1 for r in section_res if r.passed)
+                sec_total = len(section_res)
+                safe_name = html_module.escape(section_name)
+                html += f"""
+                <div class="section-header">
+                    <span>{safe_name}</span>
+                    <span class="section-badge">{sec_passed}/{sec_total} passed</span>
+                </div>
+                """
+                html += table_header
+                html += self._results_table_rows(section_res)
+                html += table_footer
+        else:
+            html = shared_styles + summary_html + table_header
+            html += self._results_table_rows(self.results)
+            html += table_footer
 
         display(HTML(html))
