@@ -29,8 +29,9 @@ Attributes:
 import re
 import sys
 import io
+import builtins
 import html as html_module
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stdout, redirect_stderr, contextmanager, nullcontext
 from typing import List, Dict, Any, Callable, Optional
 from dataclasses import dataclass, field
 from IPython.display import HTML, display
@@ -373,6 +374,28 @@ class ColabTestFramework:
         self.section_results: List[tuple] = []  # List of (section_name, List[TestResult])
         self.student_code = ""
 
+    @contextmanager
+    def _stdin_redirected(self, stdin_input: str):
+        """Simulate stdin for the duration of a test call.
+
+        Patches both ``sys.stdin`` and the ``input`` builtin. A live
+        Jupyter/Colab kernel intercepts ``input()`` itself and never consults
+        ``sys.stdin``, so swapping ``sys.stdin`` alone is not enough — the
+        builtin must be patched too for stdin simulation to work under a
+        real kernel (it's also what makes exec()-based cell tests, which
+        already override ``input`` in their own namespace, keep working).
+        """
+        old_stdin = sys.stdin
+        old_input = builtins.input
+        stream = io.StringIO(stdin_input)
+        sys.stdin = stream
+        builtins.input = lambda prompt='': stream.readline().rstrip('\n')
+        try:
+            yield
+        finally:
+            sys.stdin = old_stdin
+            builtins.input = old_input
+
     def load_last_cell(self) -> str:
         """Load the code from the last executed cell.
 
@@ -469,41 +492,35 @@ class ColabTestFramework:
             with existing variables and avoid recursion issues.
         """
         try:
-            # Prepare stdin
-            old_stdin = sys.stdin
-            sys.stdin = io.StringIO(stdin_input)
-
             # Capture stdout
             f = io.StringIO()
 
-            try:
-                with redirect_stdout(f):
-                    # Create a namespace with built-in input redirected
-                    exec_namespace = {
-                        '__builtins__': __builtins__,
-                        'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
-                    }
-                    # Execute the student code in namespace with custom input
-                    exec(self.student_code, exec_namespace)
+            with self._stdin_redirected(stdin_input), redirect_stdout(f):
+                # Execute the student code in an isolated namespace. __name__
+                # is set to '__main__' so that the student's own
+                # `if __name__ == "__main__": main()` guard actually fires —
+                # exec() otherwise leaves __name__ as 'builtins'.
+                exec_namespace = {
+                    '__builtins__': __builtins__,
+                    '__name__': '__main__',
+                }
+                exec(self.student_code, exec_namespace)
 
-                output = f.getvalue().strip()
-                expected = expected_output.strip()
-                passed = output == expected
+            output = f.getvalue().strip()
+            expected = expected_output.strip()
+            passed = output == expected
 
-                output_display = f"'{output}'" if output else "(nothing printed)"
-                expected_display = f"'{expected}'" if expected else "(nothing)"
+            output_display = f"'{output}'" if output else "(nothing printed)"
+            expected_display = f"'{expected}'" if expected else "(nothing)"
 
-                return TestResult(
-                    test_name,
-                    passed,
-                    f"Expected: {expected_display} | Got: {output_display}",
-                    None
-                )
-            finally:
-                sys.stdin = old_stdin
+            return TestResult(
+                test_name,
+                passed,
+                f"Expected: {expected_display} | Got: {output_display}",
+                None
+            )
 
         except Exception as e:
-            sys.stdin = old_stdin
             return TestResult(
                 test_name,
                 False,
@@ -532,30 +549,25 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            old_stdin = sys.stdin
-            sys.stdin = io.StringIO(stdin_input)
             captured = io.StringIO()
 
-            try:
-                with redirect_stdout(captured):
-                    if function_name:
-                        func = get_ipython().user_ns.get(function_name)
-                        if func is None:
-                            return TestResult(
-                                test_name, False,
-                                f"No function named '{function_name}' was found. "
-                                f"Make sure you defined it in the previous cell and ran that cell first.",
-                                None
-                            )
-                        func(*inputs)
-                    else:
-                        exec_namespace = {
-                            '__builtins__': __builtins__,
-                            'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
-                        }
-                        exec(self.student_code, exec_namespace)
-            finally:
-                sys.stdin = old_stdin
+            with self._stdin_redirected(stdin_input), redirect_stdout(captured):
+                if function_name:
+                    func = get_ipython().user_ns.get(function_name)
+                    if func is None:
+                        return TestResult(
+                            test_name, False,
+                            f"No function named '{function_name}' was found. "
+                            f"Make sure you defined it in the previous cell and ran that cell first.",
+                            None
+                        )
+                    func(*inputs)
+                else:
+                    exec_namespace = {
+                        '__builtins__': __builtins__,
+                        '__name__': '__main__',
+                    }
+                    exec(self.student_code, exec_namespace)
 
             output = captured.getvalue().strip()
             expected_str = expected.strip()
@@ -573,7 +585,6 @@ class ColabTestFramework:
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
-            sys.stdin = old_stdin
             return TestResult(
                 test_name, False,
                 "Your code produced an error while running — see details below.",
@@ -603,30 +614,25 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            old_stdin = sys.stdin
-            sys.stdin = io.StringIO(stdin_input)
             captured = io.StringIO()
 
-            try:
-                with redirect_stdout(captured):
-                    if function_name:
-                        func = get_ipython().user_ns.get(function_name)
-                        if func is None:
-                            return TestResult(
-                                test_name, False,
-                                f"No function named '{function_name}' was found. "
-                                f"Make sure you defined it in the previous cell and ran that cell first.",
-                                None
-                            )
-                        func(*inputs)
-                    else:
-                        exec_namespace = {
-                            '__builtins__': __builtins__,
-                            'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
-                        }
-                        exec(self.student_code, exec_namespace)
-            finally:
-                sys.stdin = old_stdin
+            with self._stdin_redirected(stdin_input), redirect_stdout(captured):
+                if function_name:
+                    func = get_ipython().user_ns.get(function_name)
+                    if func is None:
+                        return TestResult(
+                            test_name, False,
+                            f"No function named '{function_name}' was found. "
+                            f"Make sure you defined it in the previous cell and ran that cell first.",
+                            None
+                        )
+                    func(*inputs)
+                else:
+                    exec_namespace = {
+                        '__builtins__': __builtins__,
+                        '__name__': '__main__',
+                    }
+                    exec(self.student_code, exec_namespace)
 
             output = captured.getvalue()
             expected_lines = [line.strip() for line in expected.split('\n') if line.strip()]
@@ -644,7 +650,6 @@ class ColabTestFramework:
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
-            sys.stdin = old_stdin
             return TestResult(
                 test_name, False,
                 "Your code produced an error while running — see details below.",
@@ -748,30 +753,25 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            old_stdin = sys.stdin
-            sys.stdin = io.StringIO(stdin_input)
             captured = io.StringIO()
 
-            try:
-                with redirect_stdout(captured):
-                    if function_name:
-                        func = get_ipython().user_ns.get(function_name)
-                        if func is None:
-                            return TestResult(
-                                test_name, False,
-                                f"No function named '{function_name}' was found. "
-                                f"Make sure you defined it in the previous cell and ran that cell first.",
-                                None
-                            )
-                        func(*inputs)
-                    else:
-                        exec_namespace = {
-                            '__builtins__': __builtins__,
-                            'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
-                        }
-                        exec(self.student_code, exec_namespace)
-            finally:
-                sys.stdin = old_stdin
+            with self._stdin_redirected(stdin_input), redirect_stdout(captured):
+                if function_name:
+                    func = get_ipython().user_ns.get(function_name)
+                    if func is None:
+                        return TestResult(
+                            test_name, False,
+                            f"No function named '{function_name}' was found. "
+                            f"Make sure you defined it in the previous cell and ran that cell first.",
+                            None
+                        )
+                    func(*inputs)
+                else:
+                    exec_namespace = {
+                        '__builtins__': __builtins__,
+                        '__name__': '__main__',
+                    }
+                    exec(self.student_code, exec_namespace)
 
             output = captured.getvalue().strip()
             expected = expected_output.strip()
@@ -791,7 +791,6 @@ class ColabTestFramework:
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
-            sys.stdin = old_stdin
             return TestResult(
                 test_name, False,
                 "Your code produced an error while running — see details below.",
@@ -825,30 +824,25 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            old_stdin = sys.stdin
-            sys.stdin = io.StringIO(stdin_input)
             captured = io.StringIO()
 
-            try:
-                with redirect_stdout(captured):
-                    if function_name:
-                        func = get_ipython().user_ns.get(function_name)
-                        if func is None:
-                            return TestResult(
-                                test_name, False,
-                                f"No function named '{function_name}' was found. "
-                                f"Make sure you defined it in the previous cell and ran that cell first.",
-                                None
-                            )
-                        func(*inputs)
-                    else:
-                        exec_namespace = {
-                            '__builtins__': __builtins__,
-                            'input': lambda prompt='': sys.stdin.readline().rstrip('\n')
-                        }
-                        exec(self.student_code, exec_namespace)
-            finally:
-                sys.stdin = old_stdin
+            with self._stdin_redirected(stdin_input), redirect_stdout(captured):
+                if function_name:
+                    func = get_ipython().user_ns.get(function_name)
+                    if func is None:
+                        return TestResult(
+                            test_name, False,
+                            f"No function named '{function_name}' was found. "
+                            f"Make sure you defined it in the previous cell and ran that cell first.",
+                            None
+                        )
+                    func(*inputs)
+                else:
+                    exec_namespace = {
+                        '__builtins__': __builtins__,
+                        '__name__': '__main__',
+                    }
+                    exec(self.student_code, exec_namespace)
 
             output = captured.getvalue().strip()
             match = re.search(pattern, output, re.MULTILINE | re.DOTALL)
@@ -866,7 +860,6 @@ class ColabTestFramework:
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
-            sys.stdin = old_stdin
             return TestResult(
                 test_name, False,
                 "Your code produced an error while running — see details below.",
@@ -898,7 +891,6 @@ class ColabTestFramework:
             The function must already be defined in the IPython namespace
             (i.e., already executed by the student).
         """
-        old_stdin = None
         try:
             # Get the function from globals
             func = get_ipython().user_ns.get(func_name)
@@ -912,11 +904,9 @@ class ColabTestFramework:
                 )
 
             # Prepare stdin if provided
-            if stdin_input:
-                old_stdin = sys.stdin
-                sys.stdin = io.StringIO(stdin_input)
+            stdin_ctx = self._stdin_redirected(stdin_input) if stdin_input else nullcontext()
 
-            try:
+            with stdin_ctx:
                 args_repr = ', '.join(map(repr, inputs))
                 call_repr = f"{func_name}({args_repr})"
 
@@ -988,13 +978,8 @@ class ColabTestFramework:
                         f"Unknown test type: {test_type}",
                         None
                     )
-            finally:
-                if old_stdin:
-                    sys.stdin = old_stdin
 
         except Exception as e:
-            if old_stdin:
-                sys.stdin = old_stdin
             return TestResult(
                 test_name,
                 False,
