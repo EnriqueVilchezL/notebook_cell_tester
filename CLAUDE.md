@@ -44,6 +44,8 @@ Everything lives in a single file: `src/notebook_cell_tester/tester.py`.
 - `_shadowed_builtin_names()` — returns the builtin names the notebook namespace has rebound to **non-callables** (see *Session poisoning* below). Callable rebindings are ignored because IPython and Colab legitimately replace `open` and `exit` with their own functions.
 - `_shadowing_hint()` — explanatory suffix appended to `TestCase.__post_init__` errors, since a poisoned `str`/`list`/`int` makes the instructor's own `TestCase(..., expected=str)` raise before any framework code runs.
 - `StdinExhausted(EOFError)` — raised when student code calls `input()` more times than `stdin_input` supplies.
+- `ExecutionTimeout(BaseException)` / `OutputTooLarge(BaseException)` / `_CappedOutput` — the runaway-code guards described below.
+- `_STUDENT_FAILURES` — the tuple every test method catches: `Exception`, `SystemExit`, and the two guards. `KeyboardInterrupt` is deliberately excluded so a student can always stop a cell.
 
 ---
 
@@ -97,6 +99,16 @@ Everything lives in a single file: `src/notebook_cell_tester/tester.py`.
 **Session poisoning:** a student who writes `str = "Ana"` or `list = [1, 2]` in *any* cell rebinds that name in the shared IPython user namespace for the rest of the session. Functions defined in a notebook resolve their globals from that same namespace, so correct-looking code then fails with `'str' object is not callable`, and only a runtime restart clears it. `run_tests`/`run_sections` call `_detect_shadowed_builtins()` up front, store the result in `self.shadowed_builtins`, surface it as a banner in `display_results()`, and let `_friendly_error()` translate the resulting `TypeError`/`NameError` into an explanation instead of a traceback.
 
 **Argument isolation:** `_safe_args()` deep-copies `inputs` before every call. `TestCase` objects live in the notebook and survive re-runs of the test cell, so a student function that mutates its argument in place (`lst.sort()`, `pila.pop()`) would otherwise make the same test pass on the first run and fail on the second.
+
+**Runaway code:** a `while True` in student code used to hang the test cell forever, and if it printed, grow the captured buffer until the Colab runtime ran out of memory and died. `_time_limited()` (SIGALRM, repeating so a bare `except` cannot swallow it) stops execution after `time_limit_seconds`, and `_CappedOutput` raises after `output_limit_chars`. Both are class attributes on `ColabTestFramework`, overridable per instance. `ExecutionTimeout` and `OutputTooLarge` derive from `BaseException` for that reason, so every test method catches `_STUDENT_FAILURES` rather than `Exception`.
+
+**SystemExit:** `exit()` / `sys.exit()` in a student cell is treated as a normal end-of-program — the output printed so far is graded. Previously `SystemExit` escaped every handler and killed the whole test cell with no results table.
+
+**Notebook magics:** `_exec_student_code()` compiles the cell, and only on `SyntaxError` retries with `_strip_notebook_magics()`, which comments out `!shell` / `%magic` lines (preserving line numbers). A solution cell opening with `!pip install pandas` therefore still runs; a genuine syntax error still reports the original error.
+
+**Blaming the right thing:** `_looks_like_shadowing()` gates the shadowed-builtin explanation on error shapes a shadowed name actually produces ("object is not callable/subscriptable", or a `NameError` naming one). Otherwise a student whose real bug is `"a" + 1` would be told to rename variables and restart. Likewise `_implicated_shadowed_builtins()` limits the banner to names the student's code actually *calls* — `sum = 0` is the textbook accumulator and must not put an alarm above a perfect score — or to a run where `shadowing_suspected` was set.
+
+**Instructor mistakes fail loudly:** `TestCase.__post_init__` rejects a non-exception `expected` on `exception` tests, a non-list `inputs`, a missing `expected` on `output`/`partial_output`, a non-callable `validator`, and an uncompilable `pattern`. These used to reach the student as "Your code produced an error".
 
 **Stdin exhaustion:** `_stdin_redirected` raises `StdinExhausted` once the supplied input runs out, instead of returning `''` forever — which used to turn "your program asks for more input than expected" into a hang or an unrelated `ValueError` deep inside student code. For cell-level tests `_exec_student_code()` catches it and returns `stopped_early=True`: the output printed up to that point is still graded, and `_EARLY_STOP_NOTE` is appended to the message only if the test then fails. A program that prints everything correctly and ends with `input("Presione Enter")` therefore still passes. Function-level tests let it propagate to `_friendly_error()`.
 

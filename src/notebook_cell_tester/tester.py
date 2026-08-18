@@ -62,12 +62,57 @@ _TEST_CELL_MARKERS = (
 )
 
 
+# A runaway ``while True`` in student code used to hang the test cell forever and,
+# if it printed, grow the captured output until the Colab runtime ran out of memory
+# and died. Both limits turn that into an ordinary failed test with an explanation.
+_OUTPUT_LIMIT_CHARS = 1_000_000
+_TIME_LIMIT_SECONDS = 15.0
+
+
 class StdinExhausted(EOFError):
     """Raised when student code calls ``input()`` more times than the test supplies.
 
     Subclasses :class:`EOFError` so that student code written to read until
     end-of-input keeps behaving the way it would outside the notebook.
     """
+
+
+class ExecutionTimeout(BaseException):
+    """Raised when student code runs past :data:`_TIME_LIMIT_SECONDS`.
+
+    Deliberately not an :class:`Exception`, so a blanket ``except Exception``
+    inside student code cannot swallow it and keep looping.
+    """
+
+
+class OutputTooLarge(BaseException):
+    """Raised when student code prints past :data:`_OUTPUT_LIMIT_CHARS`.
+
+    Also outside :class:`Exception` for the same reason: the runaway loop that
+    triggers it is usually wrapped in a bare ``except``.
+    """
+
+
+class _CappedOutput(io.StringIO):
+    """stdout buffer that refuses to grow without bound."""
+
+    def __init__(self, limit: int = _OUTPUT_LIMIT_CHARS):
+        super().__init__()
+        self._limit = limit
+        self._written = 0
+
+    def write(self, text):
+        self._written += len(text)
+        if self._written > self._limit:
+            raise OutputTooLarge(
+                f"student code printed more than {self._limit} characters"
+            )
+        return super().write(text)
+
+
+# Everything a test may raise on the student's behalf. KeyboardInterrupt is left
+# out on purpose so a student can always stop a cell themselves.
+_STUDENT_FAILURES = (Exception, SystemExit, ExecutionTimeout, OutputTooLarge)
 
 
 def _shadowed_builtin_names() -> List[str]:
@@ -358,6 +403,40 @@ class TestCase:
                     f"type or tuple of types, got {self.expected!r}."
                     + _shadowing_hint()
                 )
+        if self.test_type == 'exception':
+            valid_exc = (
+                isinstance(self.expected, type)
+                and issubclass(self.expected, BaseException)
+            )
+            if not valid_exc:
+                raise ValueError(
+                    f"TestCase '{self.name}': 'expected' for 'exception' must be an "
+                    f"exception class such as ValueError, got {self.expected!r}."
+                    + _shadowing_hint()
+                )
+        if self.inputs is not None and not isinstance(self.inputs, (list, tuple)):
+            raise ValueError(
+                f"TestCase '{self.name}': 'inputs' must be a list of arguments, "
+                f"got {self.inputs!r}. Use inputs=[{self.inputs!r}] for a single argument."
+            )
+        if self.test_type in ('output', 'partial_output') and self.expected is None:
+            raise ValueError(
+                f"TestCase '{self.name}': 'expected' is required for "
+                f"test_type='{self.test_type}'."
+            )
+        if self.test_type == 'variable' and not callable(self.validator):
+            raise ValueError(
+                f"TestCase '{self.name}': 'validator' must be a function for "
+                f"test_type='variable', got {self.validator!r}."
+            )
+        if self.pattern is not None:
+            try:
+                re.compile(self.pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"TestCase '{self.name}': 'pattern' is not a valid regular "
+                    f"expression ({exc})."
+                ) from None
         if self.tolerance is not None:
             if self.test_type != 'return':
                 raise ValueError(
@@ -452,6 +531,13 @@ class ColabTestFramework:
             tester.display_results()
     """
 
+    #: Seconds a single student cell or function call may run before it is stopped.
+    #: Raise it on the instance for exercises that are legitimately slow.
+    time_limit_seconds: float = _TIME_LIMIT_SECONDS
+
+    #: Characters of output a single test may capture before it is stopped.
+    output_limit_chars: int = _OUTPUT_LIMIT_CHARS
+
     def __init__(self):
         """Initialize the testing framework with empty results and code."""
         self.results: List[TestResult] = []
@@ -459,6 +545,7 @@ class ColabTestFramework:
         self.student_code = ""
         self.warnings: List[str] = []
         self.shadowed_builtins: List[str] = []
+        self.shadowing_suspected = False
 
     @contextmanager
     def _stdin_redirected(self, stdin_input: str):
@@ -486,7 +573,7 @@ class ColabTestFramework:
                 raise StdinExhausted(
                     "input() was called more times than this test provides input for"
                 )
-            return line.rstrip('\n')
+            return line.rstrip('\n').rstrip('\r')
 
         sys.stdin = stream
         builtins.input = _fake_input
@@ -529,11 +616,30 @@ class ColabTestFramework:
                 "Your code kept calling itself until Python gave up "
                 "(infinite recursion). Check your stopping condition."
             )
-        if self.shadowed_builtins and isinstance(exc, (TypeError, NameError, AttributeError)):
+        if isinstance(exc, ExecutionTimeout):
+            return (
+                "Your program was still running after "
+                f"{self.time_limit_seconds:g} seconds, so it was stopped. This almost "
+                "always means a loop that never ends — check the condition of your "
+                "while, and make sure something inside the loop eventually changes it."
+            )
+        if isinstance(exc, OutputTooLarge):
+            return (
+                "Your program printed far more text than this exercise expects, so "
+                "it was stopped. This almost always means a print() inside a loop "
+                "that never ends."
+            )
+        if isinstance(exc, SystemExit):
+            return (
+                "Your program ended early by calling exit(). Remove that call so the "
+                "rest of your code can run."
+            )
+        if self._looks_like_shadowing(exc):
             names = ', '.join(f"'{n}'" for n in self.shadowed_builtins)
             single = len(self.shadowed_builtins) == 1
             noun = "a variable" if single else "variables"
             verb = "hides" if single else "hide"
+            self.shadowing_suspected = True
             return (
                 f"This notebook has {noun} named {names}, which {verb} Python "
                 f"functions of the same name. That breaks code that looks correct "
@@ -542,6 +648,41 @@ class ColabTestFramework:
                 f"(Runtime → Restart session) and run your cells again from the top."
             )
         return "Your code produced an error while running — see details below."
+
+    def _looks_like_shadowing(self, exc: BaseException) -> bool:
+        """True when *exc* is plausibly caused by a shadowed builtin.
+
+        Blaming shadowing for every TypeError is worse than saying nothing: a
+        student whose real bug is ``"a" + 1`` would be told to rename variables and
+        restart the runtime while their actual mistake goes unmentioned. Only the
+        error shapes a shadowed name actually produces qualify.
+        """
+        if not self.shadowed_builtins:
+            return False
+        text = str(exc)
+        if 'object is not callable' in text:
+            return True
+        if 'object is not subscriptable' in text:
+            return True
+        if isinstance(exc, NameError):
+            return any(name in text for name in self.shadowed_builtins)
+        return False
+
+    def _implicated_shadowed_builtins(self) -> List[str]:
+        """Shadowed builtins that this student's code actually calls.
+
+        ``sum = 0`` is the textbook accumulator and breaks nothing unless the
+        student also calls ``sum(...)``. Warning on every rebinding would put an
+        alarming banner above a perfect score, so the banner is reserved for names
+        the code really uses as functions — or for an error that looked like
+        shadowing while the tests ran.
+        """
+        if not self.shadowed_builtins or not self.student_code:
+            return []
+        return [
+            name for name in self.shadowed_builtins
+            if re.search(rf'\b{re.escape(name)}\s*\(', self.student_code)
+        ]
 
     def _detect_shadowed_builtins(self) -> List[str]:
         """Return builtin names the notebook namespace currently shadows.
@@ -628,6 +769,68 @@ class ColabTestFramework:
         "stopped at that point. Only what it printed before then was checked."
     )
 
+    @contextmanager
+    def _time_limited(self, seconds: Optional[float] = None):
+        """Abort student code that runs longer than *seconds*.
+
+        Uses SIGALRM, which only exists on the main thread of a Unix process —
+        exactly where a notebook kernel runs. Anywhere else this is a no-op and a
+        runaway loop behaves as it did before. The timer repeats after firing so
+        that student code which swallows the first :class:`ExecutionTimeout` in a
+        bare ``except`` still gets stopped.
+        """
+        import signal
+
+        if seconds is None:
+            seconds = self.time_limit_seconds
+
+        try:
+            previous = signal.getsignal(signal.SIGALRM)
+        except (AttributeError, ValueError):
+            yield
+            return
+
+        def _fire(signum, frame):
+            raise ExecutionTimeout(
+                f"student code ran longer than {seconds:g} seconds"
+            )
+
+        try:
+            signal.signal(signal.SIGALRM, _fire)
+            signal.setitimer(signal.ITIMER_REAL, seconds, 1.0)
+        except (AttributeError, ValueError):
+            yield
+            return
+
+        try:
+            yield
+        finally:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+            except (AttributeError, ValueError):
+                pass
+
+    def _call_student(self, func: Callable, inputs: Sequence[Any]) -> Any:
+        """Call a student function with copied arguments under the time limit."""
+        with self._time_limited():
+            return func(*self._safe_args(inputs))
+
+    @staticmethod
+    def _strip_notebook_magics(source: str) -> str:
+        """Comment out ``!shell`` and ``%magic`` lines so the cell can be exec'd.
+
+        Colab accepts these, plain ``exec`` does not. A student whose solution cell
+        opens with ``!pip install pandas`` or ``%%time`` would otherwise fail every
+        output test with a SyntaxError while their code runs fine in the notebook.
+        Lines are replaced rather than removed so reported line numbers still match
+        what the student sees.
+        """
+        return '\n'.join(
+            '# ' + line if line.strip().startswith(('!', '%')) else line
+            for line in source.splitlines()
+        )
+
     def _exec_student_code(self) -> bool:
         """Run the student's cell in a private namespace; True if it stopped early.
 
@@ -642,10 +845,25 @@ class ColabTestFramework:
             '__builtins__': builtins,
             '__name__': '__main__',
         }
+
         try:
-            exec(self.student_code, exec_namespace)
+            code = compile(self.student_code, '<celda del estudiante>', 'exec')
+        except SyntaxError as original:
+            try:
+                code = compile(self._strip_notebook_magics(self.student_code),
+                               '<celda del estudiante>', 'exec')
+            except SyntaxError:
+                raise original from None
+
+        try:
+            with self._time_limited():
+                exec(code, exec_namespace)
         except StdinExhausted:
             return True
+        except SystemExit:
+            # exit() / sys.exit() simply ends the program. Grade what it printed
+            # instead of letting SystemExit escape and kill the whole test cell.
+            return False
         return False
 
     def _document_cells(self) -> Optional[List[str]]:
@@ -892,7 +1110,7 @@ class ColabTestFramework:
         """
         try:
             # Capture stdout
-            f = io.StringIO()
+            f = _CappedOutput(self.output_limit_chars)
 
             with self._stdin_redirected(stdin_input), redirect_stdout(f):
                 # Execute the student code in an isolated namespace. __name__
@@ -914,7 +1132,7 @@ class ColabTestFramework:
 
             return TestResult(test_name, passed, message, None)
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name,
                 False,
@@ -943,7 +1161,7 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            captured = io.StringIO()
+            captured = _CappedOutput(self.output_limit_chars)
 
             with self._stdin_redirected(stdin_input), redirect_stdout(captured):
                 if function_name:
@@ -955,7 +1173,7 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*self._safe_args(inputs))
+                    self._call_student(func, inputs)
                     stopped_early = False
                 else:
                     stopped_early = self._exec_student_code()
@@ -978,7 +1196,7 @@ class ColabTestFramework:
 
             return TestResult(test_name, passed, message, None)
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name, False,
                 self._friendly_error(e),
@@ -1008,7 +1226,7 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            captured = io.StringIO()
+            captured = _CappedOutput(self.output_limit_chars)
 
             with self._stdin_redirected(stdin_input), redirect_stdout(captured):
                 if function_name:
@@ -1020,7 +1238,7 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*self._safe_args(inputs))
+                    self._call_student(func, inputs)
                     stopped_early = False
                 else:
                     stopped_early = self._exec_student_code()
@@ -1043,7 +1261,7 @@ class ColabTestFramework:
 
             return TestResult(test_name, passed, message, None)
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name, False,
                 self._friendly_error(e),
@@ -1084,7 +1302,7 @@ class ColabTestFramework:
                         f"Make sure you defined it in the previous cell and ran that cell first.",
                         None
                     )
-                value = func(*self._safe_args(inputs))
+                value = self._call_student(func, inputs)
             else:
                 if variable_name not in get_ipython().user_ns:
                     return TestResult(
@@ -1108,7 +1326,7 @@ class ColabTestFramework:
                 )
             return TestResult(test_name, passed, message, None)
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name, False,
                 self._friendly_error(e),
@@ -1147,7 +1365,7 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            captured = io.StringIO()
+            captured = _CappedOutput(self.output_limit_chars)
 
             with self._stdin_redirected(stdin_input), redirect_stdout(captured):
                 if function_name:
@@ -1159,14 +1377,25 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*self._safe_args(inputs))
+                    self._call_student(func, inputs)
                     stopped_early = False
                 else:
                     stopped_early = self._exec_student_code()
 
             output = captured.getvalue().strip()
             expected = expected_output.strip()
-            similarity = levenshtein_similarity(output, expected)
+
+            # Levenshtein costs len(output) * len(expected). A runaway loop can make
+            # output enormous, so short-circuit using the bound
+            # similarity <= min(len) / max(len): when that ceiling is already below
+            # the threshold the full matrix cannot change the verdict.
+            longest = max(len(output), len(expected))
+            shortest = min(len(output), len(expected))
+            ceiling = 1.0 if longest == 0 else shortest / longest
+            if ceiling < similarity_threshold:
+                similarity = ceiling
+            else:
+                similarity = levenshtein_similarity(output, expected)
             passed = similarity >= similarity_threshold
 
             output_display = f"'{output}'" if output else "(nothing printed)"
@@ -1184,7 +1413,7 @@ class ColabTestFramework:
 
             return TestResult(test_name, passed, message, None)
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name, False,
                 self._friendly_error(e),
@@ -1218,7 +1447,7 @@ class ColabTestFramework:
         inputs = inputs or []
 
         try:
-            captured = io.StringIO()
+            captured = _CappedOutput(self.output_limit_chars)
 
             with self._stdin_redirected(stdin_input), redirect_stdout(captured):
                 if function_name:
@@ -1230,7 +1459,7 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*self._safe_args(inputs))
+                    self._call_student(func, inputs)
                     stopped_early = False
                 else:
                     stopped_early = self._exec_student_code()
@@ -1253,7 +1482,7 @@ class ColabTestFramework:
 
             return TestResult(test_name, passed, message, None)
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name, False,
                 self._friendly_error(e),
@@ -1305,7 +1534,7 @@ class ColabTestFramework:
                 call_repr = f"{func_name}({args_repr})"
 
                 if test_type == 'return':
-                    result = func(*self._safe_args(inputs))
+                    result = self._call_student(func, inputs)
                     if tolerance is not None:
                         try:
                             passed = abs(result - expected) <= tolerance
@@ -1322,9 +1551,9 @@ class ColabTestFramework:
                     return TestResult(test_name, passed, message, None)
 
                 elif test_type == 'output':
-                    f = io.StringIO()
+                    f = _CappedOutput(self.output_limit_chars)
                     with redirect_stdout(f):
-                        func(*self._safe_args(inputs))
+                        self._call_student(func, inputs)
 
                     output = f.getvalue().strip()
                     expected_str = expected.strip() if isinstance(expected, str) else str(expected)
@@ -1342,7 +1571,7 @@ class ColabTestFramework:
 
                 elif test_type == 'exception':
                     try:
-                        result = func(*self._safe_args(inputs))
+                        result = self._call_student(func, inputs)
                         return TestResult(
                             test_name,
                             False,
@@ -1357,7 +1586,7 @@ class ColabTestFramework:
                             f"{call_repr} | Correctly raised {expected.__name__} ✓",
                             None
                         )
-                    except Exception as e:
+                    except _STUDENT_FAILURES as e:
                         return TestResult(
                             test_name,
                             False,
@@ -1373,7 +1602,7 @@ class ColabTestFramework:
                         None
                     )
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name,
                 False,
@@ -1425,7 +1654,7 @@ class ColabTestFramework:
                     )
 
             return TestResult(test_name, passed, message, None)
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name,
                 False,
@@ -1488,7 +1717,7 @@ class ColabTestFramework:
                         message = f"'{variable_name}' = {value!r} did not pass the check."
 
                 return TestResult(test_name, passed, message, None)
-            except Exception as e:
+            except _STUDENT_FAILURES as e:
                 return TestResult(
                     test_name,
                     False,
@@ -1496,7 +1725,7 @@ class ColabTestFramework:
                     traceback.format_exc()
                 )
 
-        except Exception as e:
+        except _STUDENT_FAILURES as e:
             return TestResult(
                 test_name,
                 False,
@@ -1602,6 +1831,7 @@ class ColabTestFramework:
         self.results = []
         self.section_results = []
         self.warnings = []
+        self.shadowing_suspected = False
         self.shadowed_builtins = self._detect_shadowed_builtins()
         code = self.load_last_cell(tests)
         code_loaded = bool(code)
@@ -1640,6 +1870,7 @@ class ColabTestFramework:
         self.results = []
         self.section_results = []
         self.warnings = []
+        self.shadowing_suspected = False
         self.shadowed_builtins = self._detect_shadowed_builtins()
         all_tests = [test for section in sections for test in section.tests]
         code = self.load_last_cell(all_tests)
@@ -1862,11 +2093,14 @@ class ColabTestFramework:
         """
 
         notices_html = ""
-        if self.shadowed_builtins:
+        implicated = self._implicated_shadowed_builtins()
+        if self.shadowing_suspected and not implicated:
+            implicated = list(self.shadowed_builtins)
+        if implicated:
             names = ', '.join(
-                f'<code>{html_module.escape(n)}</code>' for n in self.shadowed_builtins
+                f'<code>{html_module.escape(n)}</code>' for n in implicated
             )
-            single = len(self.shadowed_builtins) == 1
+            single = len(implicated) == 1
             noun = "a variable" if single else "variables"
             verb = "hides" if single else "hide"
             notices_html += f"""
