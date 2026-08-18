@@ -29,13 +29,92 @@ Attributes:
 import re
 import sys
 import io
+import copy
 import builtins
 import html as html_module
 from contextlib import redirect_stdout, redirect_stderr, contextmanager, nullcontext
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Callable, Optional, Sequence
 from dataclasses import dataclass, field
 from IPython.display import HTML, display
+from IPython import get_ipython
 import traceback
+
+
+# Builtin names students commonly reuse as ordinary variables.  Once a student
+# writes e.g. ``str = input(...)`` or ``list = [1, 2]`` in *any* cell, that name
+# lives in the shared IPython user namespace for the rest of the session.  Every
+# later call to ``str(...)`` then raises "'str' object is not callable" — even
+# from inside a function whose source is perfectly correct, because a function
+# defined in a notebook resolves its globals from that same shared namespace.
+# Restarting the runtime is the only cure, which is exactly why the failure
+# looks like a corrupted package instead of a shadowed name.
+_SHADOWABLE_BUILTINS = (
+    'input', 'print', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set',
+    'tuple', 'sum', 'min', 'max', 'len', 'type', 'sorted', 'reversed', 'abs',
+    'round', 'range', 'map', 'filter', 'zip', 'open', 'id', 'next', 'iter',
+    'all', 'any', 'bytes', 'format', 'vars', 'dir', 'hash', 'pow', 'divmod',
+)
+
+# Substrings that mark a cell as a *test* cell rather than a student cell.
+_TEST_CELL_MARKERS = (
+    'ColabTestFramework', 'notebook_cell_tester', 'run_tests(', 'run_sections(',
+    'display_results(', 'TestCase(', 'TestSection(',
+)
+
+
+class StdinExhausted(EOFError):
+    """Raised when student code calls ``input()`` more times than the test supplies.
+
+    Subclasses :class:`EOFError` so that student code written to read until
+    end-of-input keeps behaving the way it would outside the notebook.
+    """
+
+
+def _shadowed_builtin_names() -> List[str]:
+    """Return builtin names the notebook namespace currently rebinds to non-callables.
+
+    A student who writes ``str = "Ana"`` or ``list = [1, 2]`` in any cell poisons the
+    shared IPython namespace for the rest of the session: every later ``str(...)``
+    raises "'str' object is not callable", including inside functions whose source is
+    perfectly correct, and including the instructor's own test cell. Only non-callable
+    rebindings are reported — IPython and Colab legitimately replace some builtins
+    (``open``, ``exit``) with callables of their own.
+    """
+    try:
+        ipython = get_ipython()
+        if ipython is None:
+            return []
+        ns = ipython.user_ns
+    except Exception:
+        return []
+
+    shadowed = []
+    for name in _SHADOWABLE_BUILTINS:
+        if name not in ns:
+            continue
+        value = ns[name]
+        if value is getattr(builtins, name, None):
+            continue
+        if not callable(value):
+            shadowed.append(name)
+    return shadowed
+
+
+def _shadowing_hint() -> str:
+    """Return an explanatory suffix for errors caused by a poisoned namespace."""
+    shadowed = _shadowed_builtin_names()
+    if not shadowed:
+        return ""
+    names = ', '.join(f"'{n}'" for n in shadowed)
+    single = len(shadowed) == 1
+    noun = "variable" if single else "variables"
+    verb = "hides" if single else "hide"
+    return (
+        f"\n\nThis is almost certainly caused by the {noun} {names} in this "
+        f"notebook, which {verb} Python's built-in functions of the same name. "
+        f"Rename them, then restart the runtime (Runtime -> Restart session) and "
+        f"run every cell again from the top."
+    )
 
 
 def levenshtein_similarity(s1: str, s2: str) -> float:
@@ -277,6 +356,7 @@ class TestCase:
                 raise ValueError(
                     f"TestCase '{self.name}': 'expected' for 'type_check' must be a "
                     f"type or tuple of types, got {self.expected!r}."
+                    + _shadowing_hint()
                 )
         if self.tolerance is not None:
             if self.test_type != 'return':
@@ -323,6 +403,9 @@ class TestResult:
         message: Detailed message describing the test result.
         error: Optional error message if an exception occurred during testing.
         description: Optional subtitle shown under the test name in the results table.
+        skipped: True when the test could not be checked at all (e.g. the student's
+            code cell was never found). Skipped tests are never counted as passed,
+            but are rendered distinctly so students don't read them as wrong answers.
 
     Examples:
         Creating a test result::
@@ -339,6 +422,7 @@ class TestResult:
     message: str
     error: Optional[str] = None
     description: str = ""
+    skipped: bool = False
 
 
 class ColabTestFramework:
@@ -373,6 +457,8 @@ class ColabTestFramework:
         self.results: List[TestResult] = []
         self.section_results: List[tuple] = []  # List of (section_name, List[TestResult])
         self.student_code = ""
+        self.warnings: List[str] = []
+        self.shadowed_builtins: List[str] = []
 
     @contextmanager
     def _stdin_redirected(self, stdin_input: str):
@@ -384,94 +470,407 @@ class ColabTestFramework:
         builtin must be patched too for stdin simulation to work under a
         real kernel (it's also what makes exec()-based cell tests, which
         already override ``input`` in their own namespace, keep working).
+
+        When the supplied input runs out, :class:`StdinExhausted` is raised
+        instead of handing back an endless stream of empty strings. Feeding
+        ``''`` forever turns "your program asks for more input than expected"
+        into a hang or an unrelated ``ValueError`` deep inside student code.
         """
         old_stdin = sys.stdin
         old_input = builtins.input
         stream = io.StringIO(stdin_input)
+
+        def _fake_input(prompt=''):
+            line = stream.readline()
+            if line == '':
+                raise StdinExhausted(
+                    "input() was called more times than this test provides input for"
+                )
+            return line.rstrip('\n')
+
         sys.stdin = stream
-        builtins.input = lambda prompt='': stream.readline().rstrip('\n')
+        builtins.input = _fake_input
         try:
             yield
         finally:
             sys.stdin = old_stdin
             builtins.input = old_input
 
-    def load_last_cell(self) -> str:
-        """Load the code from the last executed cell.
+    @staticmethod
+    def _safe_args(inputs: Sequence[Any]) -> List[Any]:
+        """Return a private copy of *inputs* so tests can't contaminate each other.
 
-        Attempts multiple methods to retrieve the last executed cell's code from
-        the IPython environment, including the In variable, _i variable, and
-        history manager.
+        Student functions frequently mutate their arguments in place (``lst.sort()``,
+        ``d.pop()``). Without a copy, the ``TestCase`` objects — which live in the
+        notebook and survive across re-runs of the test cell — carry the mutation
+        forward, so the same test passes the first time it is run and fails the
+        second. Objects that cannot be deep-copied are passed through unchanged.
+        """
+        try:
+            return copy.deepcopy(list(inputs))
+        except Exception:
+            return list(inputs)
+
+    def _friendly_error(self, exc: BaseException) -> str:
+        """Translate an exception raised by student code into student-facing text."""
+        if isinstance(exc, StdinExhausted):
+            return (
+                "Your program asked for more input than this test provides. "
+                "Check how many times your code calls input() — it should match "
+                "the number of values described in the exercise."
+            )
+        if isinstance(exc, EOFError):
+            return (
+                "Your program tried to read input that wasn't there. "
+                "Check how many times your code calls input()."
+            )
+        if isinstance(exc, RecursionError):
+            return (
+                "Your code kept calling itself until Python gave up "
+                "(infinite recursion). Check your stopping condition."
+            )
+        if self.shadowed_builtins and isinstance(exc, (TypeError, NameError, AttributeError)):
+            names = ', '.join(f"'{n}'" for n in self.shadowed_builtins)
+            single = len(self.shadowed_builtins) == 1
+            noun = "a variable" if single else "variables"
+            verb = "hides" if single else "hide"
+            return (
+                f"This notebook has {noun} named {names}, which {verb} Python "
+                f"functions of the same name. That breaks code that looks correct "
+                f"(for example: \"'str' object is not callable\").\n"
+                f"Fix: rename those variables, then restart the runtime "
+                f"(Runtime → Restart session) and run your cells again from the top."
+            )
+        return "Your code produced an error while running — see details below."
+
+    def _detect_shadowed_builtins(self) -> List[str]:
+        """Return builtin names the notebook namespace currently shadows.
+
+        See :data:`_SHADOWABLE_BUILTINS` for why this matters: a shadowed builtin
+        poisons every later cell in the session and is the single most common
+        cause of "it worked yesterday / it works on another machine".
+        """
+        return _shadowed_builtin_names()
+
+    @staticmethod
+    def _is_test_cell(source: str) -> bool:
+        """True when a cell's source looks like a test cell, not a student cell."""
+        return any(marker in source for marker in _TEST_CELL_MARKERS)
+
+    @staticmethod
+    def _is_trivial_cell(source: str) -> bool:
+        """True for cells with no student Python in them (blank, comments, magics).
+
+        Students routinely run ``!pip install ...``, ``%%time`` or a bare comment
+        between their solution and the test cell. Treating such a cell as "the
+        previous cell" is what makes the same tests pass on one run and fail on
+        the next.
+        """
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if stripped.startswith(('!', '%')):
+                continue
+            return False
+        return True
+
+    @staticmethod
+    def _wanted_names(tests: Optional[Sequence['TestCase']]) -> List[str]:
+        """Collect every function/variable name the given tests refer to."""
+        names: List[str] = []
+        for test in tests or []:
+            for attr in (test.function_name, test.variable_name):
+                if attr and attr not in names:
+                    names.append(attr)
+        return names
+
+    @staticmethod
+    def _cell_defines(source: str, names: Sequence[str]) -> bool:
+        """True when *source* defines any of *names* as a function or variable."""
+        for name in names:
+            escaped = re.escape(name)
+            if re.search(rf'^\s*(?:def|class)\s+{escaped}\b', source, re.MULTILINE):
+                return True
+            if re.search(rf'^\s*{escaped}\s*(?::[^=\n]+)?\s*(?:[-+*/|&^]|//|\*\*|>>|<<)?=(?!=)',
+                         source, re.MULTILINE):
+                return True
+        return False
+
+    def _cell_history(self) -> List[str]:
+        """Return this session's executed cells, oldest first, minus the test cell.
+
+        Prefers the ``In`` list from the user namespace and falls back to the
+        history manager. The last entry is always the currently-running test
+        cell (IPython records a cell before executing it), so it is dropped.
+        """
+        cells: List[str] = []
+        try:
+            ipython = get_ipython()
+            if ipython is None:
+                return []
+
+            raw = ipython.user_ns.get('In')
+            if isinstance(raw, (list, tuple)) and len(raw) > 1:
+                # In[0] is always '' — the placeholder for "no execution yet".
+                cells = [c for c in raw[1:] if isinstance(c, str)]
+
+            if not cells:
+                history = ipython.history_manager.get_range(output=False)
+                cells = [entry[2] for entry in history if isinstance(entry[2], str)]
+        except Exception:
+            return []
+
+        return cells[:-1] if cells else []
+
+    _EARLY_STOP_NOTE = (
+        "\nNote: your program asked for more input than this test provides, so it "
+        "stopped at that point. Only what it printed before then was checked."
+    )
+
+    def _exec_student_code(self) -> bool:
+        """Run the student's cell in a private namespace; True if it stopped early.
+
+        Stopping early means the code called ``input()`` more times than the test
+        supplies. Whatever it printed before that point is still graded: a program
+        that prints everything correctly and then waits for one more keypress
+        ("Presione Enter para salir") must not be marked wrong for the keypress.
+        Raising rather than returning ``''`` forever still prevents the endless
+        loops that the old behaviour produced.
+        """
+        exec_namespace = {
+            '__builtins__': builtins,
+            '__name__': '__main__',
+        }
+        try:
+            exec(self.student_code, exec_namespace)
+        except StdinExhausted:
+            return True
+        return False
+
+    def _document_cells(self) -> Optional[List[str]]:
+        """Return the notebook's code cells in *document* order, or None.
+
+        Execution history can never answer "which cell is directly above this test
+        cell?" — students run cells out of order, and for output-only tests there is
+        no function or variable name to anchor on. Colab can answer it exactly: the
+        frontend will hand back the whole .ipynb on request. This is best-effort and
+        silently returns None outside Colab, where the history heuristic takes over.
+        """
+        try:
+            from google.colab import _message  # type: ignore
+        except Exception:
+            return None
+
+        try:
+            reply = _message.blocking_request('get_ipynb', request='', timeout_sec=10)
+        except Exception:
+            return None
+
+        try:
+            cells = reply['ipynb']['cells']
+        except (TypeError, KeyError):
+            return None
+
+        sources = []
+        for cell in cells:
+            if cell.get('cell_type') != 'code':
+                continue
+            source = cell.get('source', '')
+            if isinstance(source, list):
+                source = ''.join(source)
+            sources.append(source)
+        return sources
+
+    def _student_cell_from_document(self, current_cell: str) -> Optional[str]:
+        """Return the code cell directly above the running test cell, if knowable.
+
+        Walks up from the test cell's position in the notebook and returns the first
+        cell that is neither another test cell nor trivial. Order of execution is
+        irrelevant here, so re-running the test cell, jumping between exercises and
+        scratch cells below the solution all resolve correctly.
+        """
+        document = self._document_cells()
+        if not document or not current_cell:
+            return None
+
+        target = current_cell.strip()
+        position = None
+        for index, source in enumerate(document):
+            if source.strip() == target:
+                position = index
+        if position is None:
+            return None
+
+        for source in reversed(document[:position]):
+            # Another test cell above means the previous exercise starts here, so
+            # this exercise's solution cell is still empty. Walking further up would
+            # silently grade a different exercise's code.
+            if self._is_test_cell(source):
+                break
+            if self._is_trivial_cell(source):
+                continue
+            return source
+
+        self.warnings.append(
+            "The cell above this test does not contain any code yet. Write your "
+            "solution in it and run it, then run this test cell again."
+        )
+        return ""
+
+    def _current_cell(self) -> str:
+        """Return the source of the cell currently executing (the test cell)."""
+        try:
+            ipython = get_ipython()
+            if ipython is None:
+                return ""
+            raw = ipython.user_ns.get('In')
+            if isinstance(raw, (list, tuple)) and raw:
+                last = raw[-1]
+                return last if isinstance(last, str) else ""
+        except Exception:
+            pass
+        return ""
+
+    def _anchor_from_previous_run(self, current_cell: str,
+                                  history: List[str]) -> Optional[str]:
+        """Resolve the student cell by looking at the last run of this same test cell.
+
+        A student who finishes exercise 3 and then scrolls back to re-run the test
+        for exercise 2 leaves exercise 3's solution as the most recent code cell, so
+        "most recent" grades the wrong exercise. The cell that preceded the previous
+        run of *this* test cell is a better answer — unless the student has since
+        edited and re-run that same solution, which shows up as a recent cell closely
+        resembling the old one.
+        """
+        if not current_cell:
+            return None
+
+        previous = [i for i, src in enumerate(history) if src == current_cell]
+        if not previous:
+            return None
+        last_run = previous[-1]
+
+        def usable(sources):
+            return [src for src in sources
+                    if not self._is_test_cell(src) and not self._is_trivial_cell(src)]
+
+        anchor_candidates = usable(history[:last_run])
+        if not anchor_candidates:
+            return None
+        anchor = anchor_candidates[-1]
+
+        since = usable(history[last_run + 1:])
+        if not since:
+            # Nothing new ran: the student just clicked the test cell again.
+            return anchor
+
+        # Something ran since. If it looks like a revision of what we graded before,
+        # it is the student's new attempt; otherwise they moved to another exercise.
+        if any(levenshtein_similarity(src, anchor) >= 0.5 for src in since):
+            return None
+        return anchor
+
+    def load_last_cell(self, tests: Optional[Sequence['TestCase']] = None) -> str:
+        """Find and load the student's solution code from the session history.
+
+        The student's solution is **not** reliably ``In[-2]``. ``In`` is the list
+        of cells executed in this session, in execution order — not the order the
+        cells appear in the notebook. Students run the test cell twice, run a
+        scratch cell in between, run an install cell, or jump around the notebook,
+        and every one of those makes ``In[-2]`` point at the wrong source. That is
+        why regex and output tests appear to pass or fail at random.
+
+        This method instead scans the history backwards and picks the most recent
+        cell that is plausibly the solution:
+
+        1. Test cells and trivial cells (blank, comments-only, ``!pip``/``%magic``)
+           are discarded.
+        2. If *tests* is given, the most recent cell that actually defines one of
+           the functions or variables under test wins.
+        3. Otherwise the most recent remaining cell is used.
+
+        Args:
+            tests: Optional test cases, used to recognise the right cell by the
+                names it defines. Strongly recommended.
 
         Returns:
-            The code from the last executed cell as a string. Returns empty string
-            if code cannot be loaded or not running in IPython environment.
-
-        Note:
-            This method gets the second-to-last cell to avoid reading the test cell itself.
+            The student's code, or an empty string when no plausible cell exists.
+            Diagnostics for the student are appended to ``self.warnings``.
 
         Examples:
             Load student code::
 
                 tester = ColabTestFramework()
-                code = tester.load_last_cell()
+                code = tester.load_last_cell(tests)
                 print(f"Loaded {len(code)} characters of code")
         """
+        self.student_code = ""
+
         try:
-            # Try to get IPython instance
             ipython = get_ipython()
-            if ipython is None:
-                print("Warning: Not running in an IPython environment")
-                return ""
+        except Exception:
+            ipython = None
 
-            # Method 1: Use In variable (most reliable)
-            last_input = ipython.user_ns.get('In', [])
-            if last_input and len(last_input) > 1:
-                # Get second to last (current cell is last)
-                self.student_code = last_input[-2] if len(last_input) >= 2 else last_input[-1]
-
-                # Check if the loaded code contains test framework code
-                if 'ColabTestFramework' in self.student_code or 'run_tests' in self.student_code:
-                    print("⚠️  It looks like you ran the test cell twice!")
-                    print("📝 Please run the cell with YOUR CODE first (the one above this cell),")
-                    print("   then run this test cell again.")
-                    return ""
-
-                return self.student_code
-
-            # Method 2: Use _i variable
-            last_input = ipython.user_ns.get('_i', '')
-            if last_input:
-                self.student_code = last_input
-
-                # Check if the loaded code contains test framework code
-                if 'ColabTestFramework' in self.student_code or 'run_tests' in self.student_code:
-                    print("⚠️  It looks like you ran the test cell twice!")
-                    print("📝 Please run the cell with YOUR CODE first (the one above this cell),")
-                    print("   then run this test cell again.")
-                    return ""
-
-                return last_input
-
-            # Method 3: Use history manager
-            history = list(ipython.history_manager.get_range(output=False))
-            if history and len(history) >= 2:
-                # Get second to last entry
-                self.student_code = history[-2][2]
-
-                # Check if the loaded code contains test framework code
-                if 'ColabTestFramework' in self.student_code or 'run_tests' in self.student_code:
-                    print("⚠️  It looks like you ran the test cell twice!")
-                    print("📝 Please run the cell with YOUR CODE first (the one above this cell),")
-                    print("   then run this test cell again.")
-                    return ""
-
-                return self.student_code
-
+        if ipython is None:
+            self.warnings.append(
+                "This test cell is not running inside Jupyter or Colab, so your code "
+                "could not be read. Checks that need your source code were skipped."
+            )
             return ""
-        except Exception as e:
-            print(f"Error loading cell: {e}")
+
+        # Strategy 1 (exact, Colab only): the code cell directly above this one.
+        current_cell = self._current_cell()
+        from_document = self._student_cell_from_document(current_cell)
+        if from_document is not None:
+            self.student_code = from_document
+            return self.student_code
+
+        # Strategy 2 (heuristic): reconstruct from execution history.
+        history = self._cell_history()
+        if not history:
+            self.warnings.append(
+                "No previous cell was found in this session. Run the cell with your "
+                "solution first, then run this test cell again."
+            )
             return ""
+
+        candidates = [
+            src for src in history
+            if not self._is_test_cell(src) and not self._is_trivial_cell(src)
+        ]
+        if not candidates:
+            self.warnings.append(
+                "I could only find test cells in this session. Run the cell with YOUR "
+                "code (the one above this cell), then run this test cell again."
+            )
+            return ""
+
+        wanted = self._wanted_names(tests)
+        chosen = None
+        if wanted:
+            for src in reversed(candidates):
+                if self._cell_defines(src, wanted):
+                    chosen = src
+                    break
+
+        if chosen is None:
+            chosen = self._anchor_from_previous_run(current_cell, history)
+
+        if chosen is None:
+            chosen = candidates[-1]
+            if wanted and history and self._is_test_cell(history[-1]):
+                # The most recent thing that ran was another test cell, and nothing
+                # in the session defines what we're testing.
+                self.warnings.append(
+                    "I could not find a cell defining "
+                    + ", ".join(f"'{n}'" for n in wanted)
+                    + ". Make sure you ran the cell with your solution, then run this "
+                    "test cell again."
+                )
+
+        self.student_code = chosen
+        return self.student_code
 
     def test_cell_output(self, test_name: str, stdin_input: str, expected_output: str) -> TestResult:
         """Test the entire cell's output with given stdin input.
@@ -500,11 +899,7 @@ class ColabTestFramework:
                 # is set to '__main__' so that the student's own
                 # `if __name__ == "__main__": main()` guard actually fires —
                 # exec() otherwise leaves __name__ as 'builtins'.
-                exec_namespace = {
-                    '__builtins__': __builtins__,
-                    '__name__': '__main__',
-                }
-                exec(self.student_code, exec_namespace)
+                stopped_early = self._exec_student_code()
 
             output = f.getvalue().strip()
             expected = expected_output.strip()
@@ -513,18 +908,17 @@ class ColabTestFramework:
             output_display = f"'{output}'" if output else "(nothing printed)"
             expected_display = f"'{expected}'" if expected else "(nothing)"
 
-            return TestResult(
-                test_name,
-                passed,
-                f"Expected: {expected_display} | Got: {output_display}",
-                None
-            )
+            message = f"Expected: {expected_display} | Got: {output_display}"
+            if not passed and stopped_early:
+                message += self._EARLY_STOP_NOTE
+
+            return TestResult(test_name, passed, message, None)
 
         except Exception as e:
             return TestResult(
                 test_name,
                 False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -561,13 +955,10 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*inputs)
+                    func(*self._safe_args(inputs))
+                    stopped_early = False
                 else:
-                    exec_namespace = {
-                        '__builtins__': __builtins__,
-                        '__name__': '__main__',
-                    }
-                    exec(self.student_code, exec_namespace)
+                    stopped_early = self._exec_student_code()
 
             output = captured.getvalue().strip()
             expected_str = expected.strip()
@@ -582,12 +973,15 @@ class ColabTestFramework:
                     f"  Expected to find: '{expected_str}'\n"
                     f"  Got: {output_display}"
                 )
+            if not passed and stopped_early:
+                message += self._EARLY_STOP_NOTE
+
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
             return TestResult(
                 test_name, False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -626,13 +1020,10 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*inputs)
+                    func(*self._safe_args(inputs))
+                    stopped_early = False
                 else:
-                    exec_namespace = {
-                        '__builtins__': __builtins__,
-                        '__name__': '__main__',
-                    }
-                    exec(self.student_code, exec_namespace)
+                    stopped_early = self._exec_student_code()
 
             output = captured.getvalue()
             expected_lines = [line.strip() for line in expected.split('\n') if line.strip()]
@@ -647,12 +1038,15 @@ class ColabTestFramework:
                     f"Your output is missing {len(missing)} expected line(s):\n"
                     f"  • {missing_fmt}"
                 )
+            if not passed and stopped_early:
+                message += self._EARLY_STOP_NOTE
+
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
             return TestResult(
                 test_name, False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -690,7 +1084,7 @@ class ColabTestFramework:
                         f"Make sure you defined it in the previous cell and ran that cell first.",
                         None
                     )
-                value = func(*inputs)
+                value = func(*self._safe_args(inputs))
             else:
                 if variable_name not in get_ipython().user_ns:
                     return TestResult(
@@ -717,7 +1111,7 @@ class ColabTestFramework:
         except Exception as e:
             return TestResult(
                 test_name, False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -765,13 +1159,10 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*inputs)
+                    func(*self._safe_args(inputs))
+                    stopped_early = False
                 else:
-                    exec_namespace = {
-                        '__builtins__': __builtins__,
-                        '__name__': '__main__',
-                    }
-                    exec(self.student_code, exec_namespace)
+                    stopped_early = self._exec_student_code()
 
             output = captured.getvalue().strip()
             expected = expected_output.strip()
@@ -788,12 +1179,15 @@ class ColabTestFramework:
                 f"Got: {output_display} | "
                 f"Similarity: {similarity_pct}"
             )
+            if not passed and stopped_early:
+                message += self._EARLY_STOP_NOTE
+
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
             return TestResult(
                 test_name, False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -836,13 +1230,10 @@ class ColabTestFramework:
                             f"Make sure you defined it in the previous cell and ran that cell first.",
                             None
                         )
-                    func(*inputs)
+                    func(*self._safe_args(inputs))
+                    stopped_early = False
                 else:
-                    exec_namespace = {
-                        '__builtins__': __builtins__,
-                        '__name__': '__main__',
-                    }
-                    exec(self.student_code, exec_namespace)
+                    stopped_early = self._exec_student_code()
 
             output = captured.getvalue().strip()
             match = re.search(pattern, output, re.MULTILINE | re.DOTALL)
@@ -857,12 +1248,15 @@ class ColabTestFramework:
                     output_display = f"'{output}'" if output else "(nothing printed)"
                     message = f"The expected pattern was not found in your output. Got: {output_display}"
 
+            if not passed and stopped_early:
+                message += self._EARLY_STOP_NOTE
+
             return TestResult(test_name, passed, message, None)
 
         except Exception as e:
             return TestResult(
                 test_name, False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -911,7 +1305,7 @@ class ColabTestFramework:
                 call_repr = f"{func_name}({args_repr})"
 
                 if test_type == 'return':
-                    result = func(*inputs)
+                    result = func(*self._safe_args(inputs))
                     if tolerance is not None:
                         try:
                             passed = abs(result - expected) <= tolerance
@@ -930,7 +1324,7 @@ class ColabTestFramework:
                 elif test_type == 'output':
                     f = io.StringIO()
                     with redirect_stdout(f):
-                        func(*inputs)
+                        func(*self._safe_args(inputs))
 
                     output = f.getvalue().strip()
                     expected_str = expected.strip() if isinstance(expected, str) else str(expected)
@@ -948,7 +1342,7 @@ class ColabTestFramework:
 
                 elif test_type == 'exception':
                     try:
-                        result = func(*inputs)
+                        result = func(*self._safe_args(inputs))
                         return TestResult(
                             test_name,
                             False,
@@ -983,7 +1377,7 @@ class ColabTestFramework:
             return TestResult(
                 test_name,
                 False,
-                "Your code produced an error while running — see details below.",
+                self._friendly_error(e),
                 traceback.format_exc()
             )
 
@@ -1113,12 +1507,24 @@ class ColabTestFramework:
     def _dispatch_test(self, test: TestCase, code_loaded: bool) -> Optional[TestResult]:
         """Dispatch a single TestCase to the appropriate test method.
 
-        Returns None when code_loaded is False and the test requires student source.
+        Tests that need the student's source but could not get it come back marked
+        ``skipped`` rather than as ``None``. Dropping them silently changed the size
+        of the results table between runs, so a student could see "3/3 passed" on a
+        run where five checks never happened.
         """
         _namespace_only = {'variable', 'type_check'}
 
         if not code_loaded and test.test_type not in _namespace_only:
-            return None
+            return TestResult(
+                test.name,
+                False,
+                "This check could not run because your code cell was not found. "
+                "Run the cell with your solution (the one above this test), then "
+                "run this test cell again.",
+                None,
+                test.description,
+                skipped=True,
+            )
 
         if test.test_type == 'regex':
             result = self.test_code_pattern(
@@ -1195,7 +1601,9 @@ class ColabTestFramework:
         """
         self.results = []
         self.section_results = []
-        code = self.load_last_cell()
+        self.warnings = []
+        self.shadowed_builtins = self._detect_shadowed_builtins()
+        code = self.load_last_cell(tests)
         code_loaded = bool(code)
 
         for test in tests:
@@ -1231,7 +1639,10 @@ class ColabTestFramework:
         """
         self.results = []
         self.section_results = []
-        code = self.load_last_cell()
+        self.warnings = []
+        self.shadowed_builtins = self._detect_shadowed_builtins()
+        all_tests = [test for section in sections for test in section.tests]
+        code = self.load_last_cell(all_tests)
         code_loaded = bool(code)
 
         for section in sections:
@@ -1249,8 +1660,12 @@ class ColabTestFramework:
         """Return the HTML <tr> rows for a list of TestResult objects."""
         rows = ""
         for result in results:
-            status_class = "status-pass" if result.passed else "status-fail"
-            status_text = "✓ PASS" if result.passed else "✗ FAIL"
+            if result.skipped:
+                status_class, status_text = "status-skip", "⚠ NOT RUN"
+            elif result.passed:
+                status_class, status_text = "status-pass", "✓ PASS"
+            else:
+                status_class, status_text = "status-fail", "✗ FAIL"
 
             safe_message = html_module.escape(result.message).replace('\n', '<br>')
 
@@ -1305,9 +1720,12 @@ class ColabTestFramework:
             print("⚠️  No tests were executed.")
             print("📝 Make sure to execute the cell with your solution code first,")
             print("   then run this test cell.")
+            for warning in self.warnings:
+                print(f"   {warning}")
             return
 
         passed = sum(1 for r in self.results if r.passed)
+        skipped = sum(1 for r in self.results if r.skipped)
         percentage = (passed / total * 100)
 
         shared_styles = """
@@ -1349,6 +1767,29 @@ class ColabTestFramework:
                 font-weight: bold;
                 text-align: center;
                 border-radius: 4px;
+            }
+            .status-skip {
+                background-color: #fff3cd;
+                color: #7a5b00;
+                font-weight: bold;
+                text-align: center;
+                border-radius: 4px;
+            }
+            .notice {
+                background: #fff8e1;
+                border-left: 5px solid #f0ad4e;
+                color: #6b4e00;
+                padding: 12px 16px;
+                border-radius: 6px;
+                margin: 16px 0 0 0;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                font-size: 13px;
+                line-height: 1.5;
+            }
+            .notice b {
+                display: block;
+                margin-bottom: 4px;
+                font-size: 14px;
             }
             .summary {
                 background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
@@ -1404,12 +1845,48 @@ class ColabTestFramework:
         </style>
         """
 
+        if passed == total:
+            verdict = '🎉 All tests passed!'
+        elif skipped:
+            verdict = (
+                f'⚠️ {skipped} check(s) could not run — see the notes below.'
+            )
+        else:
+            verdict = '⚠️ Some tests failed — review the details below.'
+
         summary_html = f"""
         <div class="summary">
             Test Results: {passed}/{total} passed ({percentage:.1f}%)
-            {'🎉 All tests passed!' if passed == total else '⚠️ Some tests failed — review the details below.'}
+            {verdict}
         </div>
         """
+
+        notices_html = ""
+        if self.shadowed_builtins:
+            names = ', '.join(
+                f'<code>{html_module.escape(n)}</code>' for n in self.shadowed_builtins
+            )
+            single = len(self.shadowed_builtins) == 1
+            noun = "a variable" if single else "variables"
+            verb = "hides" if single else "hide"
+            notices_html += f"""
+        <div class="notice">
+            <b>⚠ This notebook's session is in a broken state</b>
+            You have {noun} named {names}, which {verb} Python functions of the same
+            name. This makes correct code fail with errors like
+            <code>'str' object is not callable</code>, and it stays broken until the
+            session is restarted.<br>
+            <b style="display:inline">What to do:</b> rename those variables in your
+            code, then go to <b style="display:inline">Runtime → Restart session</b>
+            and run your cells again from the top.
+        </div>
+            """
+        for warning in self.warnings:
+            notices_html += (
+                '<div class="notice">'
+                + html_module.escape(warning).replace('\n', '<br>')
+                + '</div>'
+            )
 
         table_header = """
         <table class="test-results">
@@ -1428,7 +1905,7 @@ class ColabTestFramework:
         """
 
         if self.section_results:
-            html = shared_styles + summary_html
+            html = shared_styles + summary_html + notices_html
             for section_name, section_res in self.section_results:
                 sec_passed = sum(1 for r in section_res if r.passed)
                 sec_total = len(section_res)
@@ -1443,7 +1920,7 @@ class ColabTestFramework:
                 html += self._results_table_rows(section_res)
                 html += table_footer
         else:
-            html = shared_styles + summary_html + table_header
+            html = shared_styles + summary_html + notices_html + table_header
             html += self._results_table_rows(self.results)
             html += table_footer
 

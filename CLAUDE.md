@@ -28,15 +28,22 @@ Everything lives in a single file: `src/notebook_cell_tester/tester.py`.
 
 - `TestCase` — dataclass describing one test. `test_type` selects the strategy; `__post_init__` validates all required companion fields.
 - `TestSection` — dataclass grouping a named list of `TestCase` objects into a visual section. Fields: `name: str`, `tests: List[TestCase]`.
-- `TestResult` — dataclass returned by every test method: `test_name`, `passed`, `message`, `error`, `description`.
+- `TestResult` — dataclass returned by every test method: `test_name`, `passed`, `message`, `error`, `description`, `skipped`.
 - `ColabTestFramework` — orchestrates the full workflow:
-  1. `load_last_cell()` reads `In[-2]` from the IPython namespace (three fallback strategies) so it captures the student's cell, not the test cell.
-  2. `_dispatch_test(test, code_loaded)` — private helper that routes a single `TestCase` to the right method; returns `None` when source is unavailable and the test requires it.
+  1. `load_last_cell(tests)` finds the student's cell. It does **not** use `In[-2]`: `In` is execution order, not notebook order, so `In[-2]` points at the wrong cell whenever the student re-runs the test cell, runs a scratch cell, or jumps around the notebook. Two strategies, in order:
+     - **Document order (Colab, exact).** `_document_cells()` asks the Colab frontend for the notebook via `google.colab._message.blocking_request('get_ipynb')`; `_student_cell_from_document()` locates the running test cell by source and walks *up* to the nearest code cell that is neither a test cell nor trivial. Another test cell above is a hard boundary — it means this exercise's solution cell is still empty, and walking past it would grade a different exercise. Execution order is irrelevant to this path.
+     - **Execution history (Jupyter, heuristic).** Scans backwards over `In`, discarding test cells (`_is_test_cell`) and trivial cells (`_is_trivial_cell` — blank, comments-only, `!shell`/`%magic`); prefers the most recent cell defining a name the tests reference (`_cell_defines`); then `_anchor_from_previous_run()`, which re-uses the cell graded the last time this same test cell ran (guarded by a `levenshtein_similarity` check so an edited-and-re-run solution still wins); then the most recent remaining cell.
+  2. `_dispatch_test(test, code_loaded)` — private helper that routes a single `TestCase` to the right method. When source is unavailable and the test needs it, the test comes back marked `skipped=True` rather than being dropped, so the size of the results table never silently changes between runs.
   3. `run_tests(tests)` calls `_dispatch_test` for each `TestCase` in a flat list; results stored in `self.results`.
   4. `run_sections(sections)` calls `_dispatch_test` per section; results stored grouped in `self.section_results` (list of `(name, List[TestResult])`) and flat in `self.results`.
   5. `display_results()` renders an HTML table via `IPython.display`. When `self.section_results` is non-empty, each section gets its own header and table; otherwise a single flat table is shown.
 
-**Module-level utility:** `levenshtein_similarity(s1, s2)` — O(n·m) space-optimized DP, returns float in [0, 1]. Used only by `test_partial_output`.
+**Module-level utilities:**
+
+- `levenshtein_similarity(s1, s2)` — O(n·m) space-optimized DP, returns float in [0, 1]. Used only by `test_partial_output`.
+- `_shadowed_builtin_names()` — returns the builtin names the notebook namespace has rebound to **non-callables** (see *Session poisoning* below). Callable rebindings are ignored because IPython and Colab legitimately replace `open` and `exit` with their own functions.
+- `_shadowing_hint()` — explanatory suffix appended to `TestCase.__post_init__` errors, since a poisoned `str`/`list`/`int` makes the instructor's own `TestCase(..., expected=str)` raise before any framework code runs.
+- `StdinExhausted(EOFError)` — raised when student code calls `input()` more times than `stdin_input` supplies.
 
 ---
 
@@ -87,6 +94,12 @@ Everything lives in a single file: `src/notebook_cell_tester/tester.py`.
 
 **Namespace-only tests:** `variable` and `type_check`-on-variable tests only need the IPython namespace. Both `run_tests` and `run_sections` run these even when `load_last_cell()` returns an empty string (e.g., when the student hasn't run their cell yet).
 
+**Session poisoning:** a student who writes `str = "Ana"` or `list = [1, 2]` in *any* cell rebinds that name in the shared IPython user namespace for the rest of the session. Functions defined in a notebook resolve their globals from that same namespace, so correct-looking code then fails with `'str' object is not callable`, and only a runtime restart clears it. `run_tests`/`run_sections` call `_detect_shadowed_builtins()` up front, store the result in `self.shadowed_builtins`, surface it as a banner in `display_results()`, and let `_friendly_error()` translate the resulting `TypeError`/`NameError` into an explanation instead of a traceback.
+
+**Argument isolation:** `_safe_args()` deep-copies `inputs` before every call. `TestCase` objects live in the notebook and survive re-runs of the test cell, so a student function that mutates its argument in place (`lst.sort()`, `pila.pop()`) would otherwise make the same test pass on the first run and fail on the second.
+
+**Stdin exhaustion:** `_stdin_redirected` raises `StdinExhausted` once the supplied input runs out, instead of returning `''` forever — which used to turn "your program asks for more input than expected" into a hang or an unrelated `ValueError` deep inside student code. For cell-level tests `_exec_student_code()` catches it and returns `stopped_early=True`: the output printed up to that point is still graded, and `_EARLY_STOP_NOTE` is appended to the message only if the test then fails. A program that prints everything correctly and ends with `input("Presione Enter")` therefore still passes. Function-level tests let it propagate to `_friendly_error()`.
+
 ---
 
 ## Display Behavior
@@ -95,7 +108,8 @@ Everything lives in a single file: `src/notebook_cell_tester/tester.py`.
 
 - **Summary banner** — gradient bar showing `passed/total (%)` and a congratulatory or warning message.
 - **Section headers** — when `run_sections()` was used, each section renders a purple gradient header bar with the section name on the left and `n/total passed` badge on the right, followed by its own table.
-- **Status column** — green `✓ PASS` or red `✗ FAIL` badge.
+- **Notice banners** — amber blocks under the summary for a poisoned namespace (`self.shadowed_builtins`) and for code-discovery problems (`self.warnings`).
+- **Status column** — green `✓ PASS`, red `✗ FAIL`, or amber `⚠ NOT RUN` badge (the last for `result.skipped`).
 - **Test column** — test name, with `description` shown as a small italic subtitle if set.
 - **Details column** — `result.message` (HTML-escaped, newlines converted to `<br>`).
 - **Collapsible error** — when `result.error` is set, a `<details><summary>⚠ Show technical details</summary>` block hides the raw traceback by default. This keeps the table readable for students while preserving diagnostic info.
