@@ -901,12 +901,19 @@ class ColabTestFramework:
         return sources
 
     def _student_cell_from_document(self, current_cell: str) -> Optional[str]:
-        """Return the code cell directly above the running test cell, if knowable.
+        """Return the student's solution for the exercise this test cell belongs to.
 
-        Walks up from the test cell's position in the notebook and returns the first
-        cell that is neither another test cell nor trivial. Order of execution is
-        irrelevant here, so re-running the test cell, jumping between exercises and
-        scratch cells below the solution all resolve correctly.
+        An exercise is the run of code cells between the previous test cell and this
+        one, so the solution is *all* of them joined in document order — students are
+        told they may split their work across cells, and a solution split in two is
+        not gradeable from its second half alone (the names it needs live in the
+        first). Joining also matches the rule the notebook itself states: the cells
+        must work when run in order.
+
+        Trivial cells (blank, comments-only, ``!shell``/``%magic``) are left out, and
+        another test cell above ends the range — walking past it would pull in a
+        different exercise's code. Execution order is irrelevant throughout, so
+        re-running this test cell or jumping between exercises changes nothing.
         """
         document = self._document_cells()
         if not document or not current_cell:
@@ -920,21 +927,23 @@ class ColabTestFramework:
         if position is None:
             return None
 
+        collected: List[str] = []
         for source in reversed(document[:position]):
-            # Another test cell above means the previous exercise starts here, so
-            # this exercise's solution cell is still empty. Walking further up would
-            # silently grade a different exercise's code.
             if self._is_test_cell(source):
                 break
             if self._is_trivial_cell(source):
                 continue
-            return source
+            collected.append(source)
 
-        self.warnings.append(
-            "The cell above this test does not contain any code yet. Write your "
-            "solution in it and run it, then run this test cell again."
-        )
-        return ""
+        if not collected:
+            self.warnings.append(
+                "The cell above this test does not contain any code yet. Write your "
+                "solution in it and run it, then run this test cell again."
+            )
+            return ""
+
+        collected.reverse()
+        return '\n\n'.join(source.rstrip() for source in collected) + '\n' 
 
     def _current_cell(self) -> str:
         """Return the source of the cell currently executing (the test cell)."""
